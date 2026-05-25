@@ -25,6 +25,8 @@ ANIO  = str(_ant.year)
 
 URL      = "https://seros.conexia.com.ar:8443/WebPrestador/"
 EXCEL    = Path(os.getenv("EXCEL_PATH","credenciales_seros.xlsx"))
+DESDE    = int(os.getenv("DESDE", "0"))   # registro inicial 1-based (0=sin límite)
+HASTA    = int(os.getenv("HASTA", "0"))   # registro final 1-based inclusivo (0=sin límite)
 # Subcarpeta por fecha de ejecución: output/20260524_HHmm/
 _run_ts  = datetime.now().strftime("%Y%m%d_%H%M")
 SALIDA   = Path(os.getenv("OUTPUT_DIR","./output")) / _run_ts
@@ -81,8 +83,22 @@ def leer_excel(path):
         u,c=g(col["usuario"]),g(col["clave"])
         if not u or not c: continue
         grupos[(u,c)].append({"nombre":g(col["profesional"]),"cuit":g(col["cuit"])})
-    log.info(f"Excel: {len(grupos)} usuarios, {sum(len(v) for v in grupos.values())} registros")
-    return dict(grupos)
+    grupos_dict = dict(grupos)
+
+    # Filtro de rango si se especificó (1-based)
+    if desde > 0 or hasta > 0:
+        todos_reg = [(k, p) for k, prests in grupos_dict.items() for p in prests]
+        d = (desde - 1) if desde > 0 else 0
+        h = hasta if hasta > 0 else len(todos_reg)
+        filtrado: dict = {}
+        for (k, p) in todos_reg[d:h]:
+            filtrado.setdefault(k, []).append(p)
+        tot = sum(len(v) for v in filtrado.values())
+        log.info(f"Excel: {tot} registros (rango {desde}-{h} de {len(todos_reg)} total)")
+        return filtrado
+
+    log.info(f"Excel: {len(grupos_dict)} usuarios, {sum(len(v) for v in grupos_dict.values())} registros")
+    return grupos_dict
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1064,7 +1080,7 @@ def consolidar_excel(todos_resultados: list, output_dir: Path) -> Path | None:
 
 async def main():
     log.info(f"{'='*56}\nBot Conexia SEROS — {MES} {ANIO}\n{'='*56}")
-    grupos = leer_excel(EXCEL)
+    grupos = leer_excel(EXCEL, DESDE, HASTA)
     todos  = []
 
     async with async_playwright() as pw:
