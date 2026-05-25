@@ -1084,15 +1084,37 @@ async def main():
         for i, ((u, c), prests) in enumerate(lista, 1):
             log.info(f"\n[{i}/{len(lista)}] {u}")
             try:
-                r = await procesar_usuario(ctx, u, c, prests)
+                # Timeout de 8 minutos por usuario completo
+                r = await asyncio.wait_for(
+                    procesar_usuario(ctx, u, c, prests),
+                    timeout=480
+                )
                 todos.extend(r)
+            except asyncio.TimeoutError:
+                log.error(f"  TIMEOUT 8min — {u} cancelado automáticamente")
+                for p in prests:
+                    todos.append({"usuario":u,"profesional":p["nombre"],"cuit":p["cuit"],
+                                  "html":None,"pdf":None,"estado":"error_timeout",
+                                  "detalle":"Superó 8 minutos"})
+                # Cerrar todas las páginas abiertas y crear una nueva limpia
+                try:
+                    for pg in ctx.pages:
+                        await pg.close()
+                except Exception:
+                    pass
             except Exception as e:
                 log.error(f"Error {u}: {e}")
                 for p in prests:
                     todos.append({"usuario":u,"profesional":p["nombre"],"cuit":p["cuit"],
                                   "html":None,"pdf":None,"estado":"error_inesperado","detalle":str(e)})
+                # También limpiar páginas en caso de error grave
+                try:
+                    for pg in ctx.pages:
+                        await pg.close()
+                except Exception:
+                    pass
             if i < len(lista):
-                await asyncio.sleep(random.uniform(10, 20))
+                await asyncio.sleep(random.uniform(8, 15))
 
         await browser.close()
 
