@@ -1,0 +1,7 @@
+uploads/
+output/
+logs/
+__pycache__/
+*.pyc
+.env
+credenciales*.xlsx

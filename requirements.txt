@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+playwright
+openpyxl
+python-dotenv
+python-dateutil
+beautifulsoup4
+lxml
+python-multipart
