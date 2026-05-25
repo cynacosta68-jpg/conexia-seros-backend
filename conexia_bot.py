@@ -66,7 +66,7 @@ def _col(hdrs,campo):
         if any(hn==_norm(s) or hn.startswith(_norm(s)) for s in _SIN.get(campo,[campo])):
             return i
     return None
-def leer_excel(path):
+def leer_excel(path, desde: int = 0, hasta: int = 0):
     if not path.exists(): log.error(f"No encontrado: {path}"); sys.exit(1)
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]
@@ -84,6 +84,18 @@ def leer_excel(path):
         if not u or not c: continue
         grupos[(u,c)].append({"nombre":g(col["profesional"]),"cuit":g(col["cuit"])})
     grupos_dict = dict(grupos)
+
+    # Filtro de rango si se especificó (1-based)
+    if desde > 0 or hasta > 0:
+        todos_reg = [(k, p) for k, prests in grupos_dict.items() for p in prests]
+        d = (desde - 1) if desde > 0 else 0
+        h = hasta if hasta > 0 else len(todos_reg)
+        filtrado: dict = {}
+        for (k, p) in todos_reg[d:h]:
+            filtrado.setdefault(k, []).append(p)
+        tot = sum(len(v) for v in filtrado.values())
+        log.info(f"Excel: {tot} registros (rango {desde}-{h} de {len(todos_reg)} total)")
+        return filtrado
 
     # Filtro de rango si se especificó (1-based)
     if desde > 0 or hasta > 0:
