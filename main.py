@@ -244,6 +244,14 @@ def _buscar_en_carpeta(carpeta_str: str | None, patron: str) -> Path | None:
     return archivos[0] if archivos else None
 
 
+@app.get("/download/unificado/excel")
+def download_unif_excel_alias():
+    return download_unif_excel()
+
+@app.get("/download/unificado/pdfs")
+def download_unif_pdfs_alias():
+    return download_unif_pdfs()
+
 @app.get("/download/{parte}/excel")
 def download_excel(parte: int):
     if parte not in [1,2,3]:
@@ -337,7 +345,7 @@ def unificar():
     }
 
 
-@app.get("/download/unificado/excel")
+@app.get("/download/unificado/excel_full")
 def download_unif_excel():
     carpetas = sorted(
         [d for d in OUTPUT_DIR.iterdir() if d.is_dir() and d.name.startswith("unificado_")],
@@ -352,7 +360,7 @@ def download_unif_excel():
                         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
-@app.get("/download/unificado/pdfs")
+@app.get("/download/unificado/pdfs_full")
 def download_unif_pdfs():
     carpetas = sorted(
         [d for d in OUTPUT_DIR.iterdir() if d.is_dir() and d.name.startswith("unificado_")],
