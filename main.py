@@ -11,14 +11,11 @@ from fastapi.responses import FileResponse, JSONResponse
 
 app = FastAPI(title="Conexia SEROS API")
 
-# ── CORS: permitir llamadas desde Vercel ──────────────────────────────────────
-# Reemplazar con tu URL real de Vercel antes de deployar
-VERCEL_URL = os.getenv("VERCEL_URL", "*")
-
+# ── CORS: permitir llamadas desde cualquier origen ───────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[VERCEL_URL, "http://localhost:3000", "http://localhost:5500"],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
