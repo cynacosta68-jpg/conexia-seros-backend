@@ -1052,16 +1052,38 @@ def consolidar_excel(todos_resultados: list, output_dir: Path) -> Path | None:
     return ruta_xlsx
 
 
+# ── Número de workers paralelos ──────────────────────────────────────────────
+WORKERS = int(os.getenv("WORKERS", "4"))  # ajustar según memoria disponible
+
+async def procesar_usuario_safe(sem, ctx, usuario, clave, prestadores, todos, idx, total):
+    """Wrapper con semáforo para limitar concurrencia."""
+    async with sem:
+        log.info(f"\n[{idx}/{total}] {usuario} → iniciando")
+        try:
+            r = await procesar_usuario(ctx, usuario, clave, prestadores)
+            todos.extend(r)
+        except Exception as e:
+            log.error(f"Error inesperado {usuario}: {e}")
+            for p in prestadores:
+                todos.append({"usuario":usuario,"profesional":p["nombre"],"cuit":p["cuit"],
+                              "html":None,"pdf":None,"estado":"error_inesperado","detalle":str(e)})
+        # Pausa corta entre workers para no saturar el servidor
+        await asyncio.sleep(random.uniform(2, 5))
+
+
 async def main():
     log.info(f"{'='*56}\nBot Conexia SEROS — {MES} {ANIO}\n{'='*56}")
-    grupos=leer_excel(EXCEL); todos=[]
+    log.info(f"Workers paralelos: {WORKERS}")
+    grupos = leer_excel(EXCEL)
+    todos  = []
 
     async with async_playwright() as pw:
-        browser=await pw.chromium.launch(
+        browser = await pw.chromium.launch(
             headless=HEADLESS,
             args=["--no-sandbox","--disable-blink-features=AutomationControlled",
-                  "--disable-dev-shm-usage"])
-        ctx=await browser.new_context(
+                  "--disable-dev-shm-usage","--disable-gpu",
+                  "--memory-pressure-off"])
+        ctx = await browser.new_context(
             viewport={"width":1280,"height":800}, locale="es-AR",
             timezone_id="America/Argentina/Buenos_Aires",
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1069,51 +1091,60 @@ async def main():
                         "Chrome/124.0.0.0 Safari/537.36"),
             accept_downloads=True, ignore_https_errors=True)
 
-        lista=list(grupos.items())
-        for i,((u,c),prests) in enumerate(lista,1):
-            log.info(f"\n[{i}/{len(lista)}] {u}")
-            try:
-                r=await procesar_usuario(ctx,u,c,prests); todos.extend(r)
-            except Exception as e:
-                log.error(f"Error {u}: {e}")
-                for p in prests:
-                    todos.append({"usuario":u,"profesional":p["nombre"],"cuit":p["cuit"],
-                                  "html":None,"pdf":None,"estado":"error_inesperado","detalle":str(e)})
-            if i<len(lista): await asyncio.sleep(random.uniform(10,20))
+        lista  = list(grupos.items())
+        sem    = asyncio.Semaphore(WORKERS)   # máximo WORKERS usuarios a la vez
+        tasks  = []
+
+        for i, ((u, c), prests) in enumerate(lista, 1):
+            task = asyncio.create_task(
+                procesar_usuario_safe(sem, ctx, u, c, prests, todos, i, len(lista))
+            )
+            tasks.append(task)
+            # Escalonar el inicio para no hacer login masivo simultáneo
+            await asyncio.sleep(random.uniform(3, 6))
+
+        # Esperar que todos los workers terminen
+        await asyncio.gather(*tasks)
         await browser.close()
 
-        htmls=list(SALIDA.rglob("*.html"))
+        # ── HTML → PDF (paralelo también) ────────────────────────────────────
+        htmls = list(SALIDA.rglob("*.html"))
         if htmls:
             log.info(f"\nCONVIRTIENDO {len(htmls)} HTML → PDF")
             async with async_playwright() as pw2:
-                for k,h in enumerate(htmls,1):
-                    log.info(f"  [{k}/{len(htmls)}] {h.name}")
-                    pdf=await html_a_pdf(h,pw2)
-                    for r in todos:
-                        if r.get("html") and Path(r["html"])==h:
-                            r["pdf"]=str(pdf) if pdf else None; break
+                sem_pdf = asyncio.Semaphore(4)  # 4 PDFs a la vez
 
-    fall=guardar_reporte(todos)
-    ok=sum(1 for r in todos if r.get("estado")=="ok")
+                async def convertir(h):
+                    async with sem_pdf:
+                        return await html_a_pdf(h, pw2)
+
+                pdf_results = await asyncio.gather(*[convertir(h) for h in htmls])
+                for h, pdf in zip(htmls, pdf_results):
+                    for r in todos:
+                        if r.get("html") and Path(r["html"]) == h:
+                            r["pdf"] = str(pdf) if pdf else None; break
+
+    fall = guardar_reporte(todos)
+    ok   = sum(1 for r in todos if r.get("estado") == "ok")
     log.info(f"\nRESUMEN: {len(todos)} | OK:{ok} | Fallidos:{len(fall)}")
 
-    # ── ZIP con todos los PDFs ───────────────────────────────────────────────
+    # ── ZIP de PDFs ───────────────────────────────────────────────────────────
     import zipfile as _zf
     pdfs = list(SALIDA.rglob("*.pdf"))
     if pdfs:
         zip_path = SALIDA / f"PDFs_{MES}_{ANIO}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
         with _zf.ZipFile(zip_path, "w", _zf.ZIP_DEFLATED) as zf:
             for p in pdfs:
-                zf.write(p, p.name)  # todos al mismo nivel dentro del ZIP
+                zf.write(p, p.name)
         log.info(f"ZIP PDFs: {zip_path.name} ({len(pdfs)} archivos)")
 
-    # ── Excel consolidado ─────────────────────────────────────────────────
+    # ── Excel consolidado ─────────────────────────────────────────────────────
     try:
         import generar_excel
-        log.info("\nGenerando Excel consolidado (via generar_excel.py)...")
+        log.info("\nGenerando Excel consolidado...")
         generar_excel.main()
     except ImportError:
-        log.warning("generar_excel.py no encontrado en la misma carpeta.")
+        log.warning("generar_excel.py no encontrado.")
     except Exception as e:
         log.error(f"Error al generar Excel: {e}")
 
