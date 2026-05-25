@@ -88,9 +88,39 @@ def _run_bot():
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+import hashlib, secrets
+from pydantic import BaseModel
+
+# ── Usuarios: configurar via variables de entorno en Railway ──────────────────
+# Formato: USERS=usuario1:clave1,usuario2:clave2
+def _cargar_usuarios():
+    raw = os.getenv("USERS", "admin:seros2026")
+    usuarios = {}
+    for par in raw.split(","):
+        if ":" in par:
+            u, c = par.strip().split(":", 1)
+            usuarios[u.strip()] = c.strip()
+    return usuarios
+
+# Tokens de sesión activos (en memoria)
+_tokens_validos: set[str] = set()
+
+class LoginData(BaseModel):
+    usuario: str
+    clave:   str
+
 @app.get("/")
 def root():
     return {"app": "Conexia SEROS API", "version": "1.0"}
+
+@app.post("/login")
+def login(data: LoginData):
+    usuarios = _cargar_usuarios()
+    if data.usuario in usuarios and usuarios[data.usuario] == data.clave:
+        token = secrets.token_hex(32)
+        _tokens_validos.add(token)
+        return {"ok": True, "token": token}
+    raise HTTPException(401, "Credenciales incorrectas")
 
 
 @app.post("/upload")
