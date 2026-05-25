@@ -602,7 +602,7 @@ async def descargar_html(page: Page, dest: Path, nom: str) -> Path | None:
         await pausa(0.3,0.5)
         return extraer_zip(zp, dest, nom)
 
-    except PwTimeout:
+    except (PwTimeout, asyncio.TimeoutError):
         log.error(f"  Timeout — ¿sin datos para {MES} {ANIO}?")
         return None
     except Exception as e:
@@ -696,8 +696,18 @@ async def login_y_procesar(ctx, usuario: str, clave: str,
                 "html":None,"pdf":None,"estado":est,"detalle":det}
 
     try:
-        # ── Login fresco ──────────────────────────────────────────────────────
-        ok = await login(page, usuario, clave)
+        # ── Timeout máximo por usuario: 8 minutos ─────────────────────────────
+        async def _procesar_con_timeout():
+            ok = await login(page, usuario, clave)
+            return ok
+
+        try:
+            ok = await asyncio.wait_for(login(page, usuario, clave), timeout=480)
+        except asyncio.TimeoutError:
+            log.error(f"  TIMEOUT 8min — {usuario} se canceló automáticamente")
+            resultados.append(E("error_timeout", "Superó 8 minutos — se canceló"))
+            await page.close()
+            return resultados
         if not ok:
             resultados.append(E("error_login","Login fallido"))
             await page.close(); return resultados
