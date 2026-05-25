@@ -1052,28 +1052,8 @@ def consolidar_excel(todos_resultados: list, output_dir: Path) -> Path | None:
     return ruta_xlsx
 
 
-# ── Número de workers paralelos ──────────────────────────────────────────────
-WORKERS = int(os.getenv("WORKERS", "4"))  # ajustar según memoria disponible
-
-async def procesar_usuario_safe(sem, ctx, usuario, clave, prestadores, todos, idx, total):
-    """Wrapper con semáforo para limitar concurrencia."""
-    async with sem:
-        log.info(f"\n[{idx}/{total}] {usuario} → iniciando")
-        try:
-            r = await procesar_usuario(ctx, usuario, clave, prestadores)
-            todos.extend(r)
-        except Exception as e:
-            log.error(f"Error inesperado {usuario}: {e}")
-            for p in prestadores:
-                todos.append({"usuario":usuario,"profesional":p["nombre"],"cuit":p["cuit"],
-                              "html":None,"pdf":None,"estado":"error_inesperado","detalle":str(e)})
-        # Pausa corta entre workers para no saturar el servidor
-        await asyncio.sleep(random.uniform(2, 5))
-
-
 async def main():
     log.info(f"{'='*56}\nBot Conexia SEROS — {MES} {ANIO}\n{'='*56}")
-    log.info(f"Workers paralelos: {WORKERS}")
     grupos = leer_excel(EXCEL)
     todos  = []
 
@@ -1081,8 +1061,7 @@ async def main():
         browser = await pw.chromium.launch(
             headless=HEADLESS,
             args=["--no-sandbox","--disable-blink-features=AutomationControlled",
-                  "--disable-dev-shm-usage","--disable-gpu",
-                  "--memory-pressure-off"])
+                  "--disable-dev-shm-usage"])
         ctx = await browser.new_context(
             viewport={"width":1280,"height":800}, locale="es-AR",
             timezone_id="America/Argentina/Buenos_Aires",
@@ -1091,35 +1070,30 @@ async def main():
                         "Chrome/124.0.0.0 Safari/537.36"),
             accept_downloads=True, ignore_https_errors=True)
 
-        lista  = list(grupos.items())
-        sem    = asyncio.Semaphore(WORKERS)   # máximo WORKERS usuarios a la vez
-        tasks  = []
-
+        lista = list(grupos.items())
         for i, ((u, c), prests) in enumerate(lista, 1):
-            task = asyncio.create_task(
-                procesar_usuario_safe(sem, ctx, u, c, prests, todos, i, len(lista))
-            )
-            tasks.append(task)
-            # Escalonar el inicio para no hacer login masivo simultáneo
-            await asyncio.sleep(random.uniform(3, 6))
+            log.info(f"\n[{i}/{len(lista)}] {u}")
+            try:
+                r = await procesar_usuario(ctx, u, c, prests)
+                todos.extend(r)
+            except Exception as e:
+                log.error(f"Error {u}: {e}")
+                for p in prests:
+                    todos.append({"usuario":u,"profesional":p["nombre"],"cuit":p["cuit"],
+                                  "html":None,"pdf":None,"estado":"error_inesperado","detalle":str(e)})
+            if i < len(lista):
+                await asyncio.sleep(random.uniform(10, 20))
 
-        # Esperar que todos los workers terminen
-        await asyncio.gather(*tasks)
         await browser.close()
 
-        # ── HTML → PDF (paralelo también) ────────────────────────────────────
+        # ── HTML → PDF ────────────────────────────────────────────────────────
         htmls = list(SALIDA.rglob("*.html"))
         if htmls:
             log.info(f"\nCONVIRTIENDO {len(htmls)} HTML → PDF")
             async with async_playwright() as pw2:
-                sem_pdf = asyncio.Semaphore(4)  # 4 PDFs a la vez
-
-                async def convertir(h):
-                    async with sem_pdf:
-                        return await html_a_pdf(h, pw2)
-
-                pdf_results = await asyncio.gather(*[convertir(h) for h in htmls])
-                for h, pdf in zip(htmls, pdf_results):
+                for k, h in enumerate(htmls, 1):
+                    log.info(f"  [{k}/{len(htmls)}] {h.name}")
+                    pdf = await html_a_pdf(h, pw2)
                     for r in todos:
                         if r.get("html") and Path(r["html"]) == h:
                             r["pdf"] = str(pdf) if pdf else None; break
