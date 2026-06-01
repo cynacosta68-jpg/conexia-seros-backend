@@ -255,11 +255,15 @@ def get_log():
 
 
 def _buscar_en_carpeta(carpeta_str: str | None, patron: str) -> Path | None:
-    if not carpeta_str:
-        return None
-    carpeta = Path(carpeta_str)
-    archivos = sorted(carpeta.glob(patron), reverse=True)
-    return archivos[0] if archivos else None
+    """Busca un archivo por patrón. Si no hay carpeta en memoria, busca en todo output/."""
+    candidatos = []
+    if carpeta_str:
+        carpeta = Path(carpeta_str)
+        candidatos = sorted(carpeta.glob(patron), reverse=True)
+    # Fallback: buscar en todas las subcarpetas de output
+    if not candidatos and OUTPUT_DIR.exists():
+        candidatos = sorted(OUTPUT_DIR.rglob(patron), reverse=True)
+    return candidatos[0] if candidatos else None
 
 
 @app.get("/download/unificado/excel")
@@ -269,6 +273,29 @@ def download_unif_excel_alias():
 @app.get("/download/unificado/pdfs")
 def download_unif_pdfs_alias():
     return download_unif_pdfs()
+
+@app.get("/download/unificado/fallidos")
+def download_unif_fallidos():
+    """Une los archivos FALLIDOS de todas las partes en uno solo."""
+    lineas = []
+    for p in [1, 2, 3, 4]:
+        f = _buscar_en_carpeta(estados[p]["carpeta"], "FALLIDOS_*.txt")
+        if f:
+            lineas.append(f"=== PARTE {p} (registros {estados[p]['desde']}-{estados[p]['hasta']}) ===")
+            lineas.append(f.read_text(encoding="utf-8"))
+            lineas.append("")
+    if not lineas:
+        todos = sorted(OUTPUT_DIR.rglob("FALLIDOS_*.txt"), reverse=True)
+        for f in todos:
+            lineas.append(f"=== {f.parent.name} ===")
+            lineas.append(f.read_text(encoding="utf-8"))
+            lineas.append("")
+    if not lineas:
+        raise HTTPException(404, "No hay archivos de fallidos")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ruta = OUTPUT_DIR / f"FALLIDOS_consolidado_{ts}.txt"
+    ruta.write_text("\n".join(lineas), encoding="utf-8")
+    return FileResponse(str(ruta), filename=ruta.name, media_type="text/plain")
 
 @app.get("/download/{parte}/excel")
 def download_excel(parte: int):
