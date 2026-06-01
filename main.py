@@ -91,12 +91,19 @@ def _run_parte(parte: int, desde: int, hasta: int):
     e["desde"]    = desde
     e["hasta"]    = hasta
 
+    # Limpiar procesos zombie y liberar recursos antes de iniciar
+    import gc, time
+    gc.collect()
+    time.sleep(3)  # pausa para que el SO libere recursos del proceso anterior
+
     env = os.environ.copy()
     env["EXCEL_PATH"] = str(EXCEL_PATH)
     env["OUTPUT_DIR"] = str(OUTPUT_DIR)
     env["HEADLESS"]   = "true"
     env["DESDE"]      = str(desde)
     env["HASTA"]      = str(hasta)
+    # Limitar memoria de Chromium
+    env["PLAYWRIGHT_CHROMIUM_ARGS"] = "--disable-dev-shm-usage --no-sandbox --memory-pressure-off"
 
     try:
         proc = subprocess.Popen(
