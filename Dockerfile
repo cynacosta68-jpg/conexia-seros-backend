@@ -9,6 +9,10 @@ RUN apt-get update && apt-get install -y \
     libcairo2 libasound2 libxshmfence1 fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
+# Aumentar límite de file descriptors para Chromium
+RUN echo "* soft nofile 65536" >> /etc/security/limits.conf && \
+    echo "* hard nofile 65536" >> /etc/security/limits.conf
+
 WORKDIR /app
 
 COPY requirements.txt .
@@ -25,4 +29,5 @@ ENV VERCEL_URL=*
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Usar shell para poder setear ulimit antes de arrancar uvicorn
+CMD ["/bin/sh", "-c", "ulimit -n 65536 && uvicorn main:app --host 0.0.0.0 --port 8000"]
