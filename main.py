@@ -43,7 +43,7 @@ def _estado_inicial():
         "hasta":    0,
     }
 
-estados = {1: _estado_inicial(), 2: _estado_inicial(), 3: _estado_inicial()}
+estados = {1: _estado_inicial(), 2: _estado_inicial(), 3: _estado_inicial(), 4: _estado_inicial()}
 
 # Cuántos registros tiene el Excel actual
 _total_registros = 0
@@ -65,17 +65,18 @@ def _contar_registros():
 
 
 def _rangos_partes(total: int):
-    """Divide total registros en 3 partes lo más iguales posible."""
-    base = total // 3
-    resto = total % 3
+    """Divide total registros en 4 partes lo más iguales posible."""
+    n = 4
+    base = total // n
+    resto = total % n
     partes = []
     inicio = 1
-    for i in range(3):
+    for i in range(n):
         extra = 1 if i < resto else 0
         fin = inicio + base + extra - 1
         partes.append((inicio, min(fin, total)))
         inicio = fin + 1
-    return partes  # [(1,40),(41,80),(81,119)]
+    return partes  # [(1,30),(31,60),(61,90),(91,119)]
 
 
 def _run_parte(parte: int, desde: int, hasta: int):
@@ -168,7 +169,7 @@ def login(data: LoginData):
 def reset_estado():
     """Reinicia el estado de las 3 partes para una nueva ejecución."""
     global _total_registros
-    for p in [1, 2, 3]:
+    for p in [1, 2, 3, 4]:
         estados[p] = _estado_inicial()
     _total_registros = 0
     return {"ok": True}
@@ -195,8 +196,8 @@ async def upload_excel(file: UploadFile = File(...)):
 @app.post("/run/{parte}")
 def run_parte(parte: int):
     """Inicia la extracción de una parte (1, 2 o 3)."""
-    if parte not in [1, 2, 3]:
-        raise HTTPException(400, "Parte debe ser 1, 2 o 3")
+    if parte not in [1, 2, 3, 4]:
+        raise HTTPException(400, "Parte debe ser 1, 2, 3 o 4")
     e = estados[parte]
     if e["status"] == "running":
         raise HTTPException(409, f"La parte {parte} ya está ejecutándose")
@@ -264,7 +265,7 @@ def download_unif_pdfs_alias():
 
 @app.get("/download/{parte}/excel")
 def download_excel(parte: int):
-    if parte not in [1,2,3]:
+    if parte not in [1,2,3,4]:
         raise HTTPException(400, "Parte inválida")
     f = _buscar_en_carpeta(estados[parte]["carpeta"], "Consolidado_*.xlsx")
     if not f:
@@ -275,7 +276,7 @@ def download_excel(parte: int):
 
 @app.get("/download/{parte}/pdfs")
 def download_pdfs(parte: int):
-    if parte not in [1,2,3]:
+    if parte not in [1,2,3,4]:
         raise HTTPException(400, "Parte inválida")
     f = _buscar_en_carpeta(estados[parte]["carpeta"], "PDFs_*.zip")
     if not f:
@@ -285,7 +286,7 @@ def download_pdfs(parte: int):
 
 @app.get("/download/{parte}/fallidos")
 def download_fallidos(parte: int):
-    if parte not in [1,2,3]:
+    if parte not in [1,2,3,4]:
         raise HTTPException(400, "Parte inválida")
     f = _buscar_en_carpeta(estados[parte]["carpeta"], "FALLIDOS_*.txt")
     if not f:
