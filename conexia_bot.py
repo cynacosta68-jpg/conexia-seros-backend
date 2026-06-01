@@ -1098,8 +1098,16 @@ async def main():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=HEADLESS,
-            args=["--no-sandbox","--disable-blink-features=AutomationControlled",
-                  "--disable-dev-shm-usage"])
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--memory-pressure-off",
+                "--disable-background-networking",
+                "--disable-extensions",
+                "--no-first-run",
+            ])
         ctx = await browser.new_context(
             viewport={"width":1280,"height":800}, locale="es-AR",
             timezone_id="America/Argentina/Buenos_Aires",
