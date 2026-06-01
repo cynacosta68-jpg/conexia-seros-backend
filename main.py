@@ -172,6 +172,51 @@ def login(data: LoginData):
     raise HTTPException(401, "Credenciales incorrectas")
 
 
+def _unificar_background():
+    """Unifica los resultados de las 4 partes en background."""
+    import zipfile, shutil
+    try:
+        partes_done = [p for p, e in estados.items() if e["status"] == "done" and e["carpeta"]]
+        if not partes_done:
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        carpeta_unif = OUTPUT_DIR / f"unificado_{ts}"
+        carpeta_unif.mkdir(parents=True, exist_ok=True)
+
+        # Reunir HTMLs
+        for p in partes_done:
+            for h in Path(estados[p]["carpeta"]).rglob("*.html"):
+                dest = carpeta_unif / h.name
+                if dest.exists():
+                    dest = carpeta_unif / f"{h.stem}_p{p}{h.suffix}"
+                shutil.copy2(h, dest)
+
+        # ZIP de PDFs
+        todos_pdfs = []
+        for p in partes_done:
+            todos_pdfs.extend(Path(estados[p]["carpeta"]).rglob("*.pdf"))
+        zip_path = carpeta_unif / f"PDFs_Unificado_{ts}.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for pdf in todos_pdfs:
+                zf.write(pdf, pdf.name)
+
+        # Excel consolidado
+        import sys as _sys
+        _sys.path.insert(0, ".")
+        try:
+            import generar_excel as _ge
+            import os as _os
+            _os.environ["OUTPUT_DIR"] = str(carpeta_unif)
+            _ge.OUTPUT = carpeta_unif
+            _ge.main()
+        except Exception as ex:
+            log.error(f"Error generando Excel: {ex}")
+
+        log.info(f"✓ Unificación completada: {carpeta_unif}")
+    except Exception as e:
+        log.error(f"Error en unificación background: {e}")
+
+
 @app.post("/reset")
 def reset_estado():
     """Reinicia el estado de las 3 partes para una nueva ejecución."""
