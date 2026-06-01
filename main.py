@@ -164,6 +164,16 @@ def login(data: LoginData):
     raise HTTPException(401, "Credenciales incorrectas")
 
 
+@app.post("/reset")
+def reset_estado():
+    """Reinicia el estado de las 3 partes para una nueva ejecución."""
+    global _total_registros
+    for p in [1, 2, 3]:
+        estados[p] = _estado_inicial()
+    _total_registros = 0
+    return {"ok": True}
+
+
 @app.post("/upload")
 async def upload_excel(file: UploadFile = File(...)):
     if not file.filename.endswith(".xlsx"):
@@ -455,6 +465,27 @@ def _run_extranet():
         estado_extranet["status"] = "error"
 
     estado_extranet["fin"] = datetime.now().isoformat()
+
+
+@app.post("/extranet/upload-json")
+async def extranet_upload_json(file: UploadFile = File(...)):
+    """Sube el JSON generado por extranet_bot.py al servidor."""
+    if not file.filename.endswith(".json"):
+        raise HTTPException(400, "Solo se aceptan archivos .json")
+    contenido = await file.read()
+    # Guardar en output/
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ruta = OUTPUT_DIR / f"extranet_{ts}.json"
+    ruta.write_bytes(contenido)
+    # Cargar en memoria
+    datos = json.loads(contenido.decode("utf-8"))
+    comp  = _cargar_comprobantes()
+    for miembro in datos:
+        for det in miembro.get("detalle", []):
+            clave = f"{miembro['cuit']}_{det.get('nro_pedido_actuacion','')}_{det.get('nro','')}"
+            det["n_comprobante_arca"] = comp.get(clave, "")
+    estado_extranet["datos"] = datos
+    return {"ok": True, "miembros": len(datos), "archivo": ruta.name}
 
 
 @app.post("/extranet/run")
