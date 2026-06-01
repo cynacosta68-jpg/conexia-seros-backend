@@ -1112,14 +1112,15 @@ async def main():
         for i, ((u, c), prests) in enumerate(lista, 1):
             log.info(f"\n[{i}/{len(lista)}] {u}")
             try:
-                # Timeout de 8 minutos por usuario completo
+                # Timeout por usuario: 3 min base + 2 min por registro
+                _timeout = min(180 + len(prests) * 120, 1800)  # máx 30 min
                 r = await asyncio.wait_for(
                     procesar_usuario(ctx, u, c, prests),
-                    timeout=480
+                    timeout=_timeout
                 )
                 todos.extend(r)
             except asyncio.TimeoutError:
-                log.error(f"  TIMEOUT 8min — {u} cancelado automáticamente")
+                log.error(f"  TIMEOUT — {u} cancelado automáticamente (timeout={_timeout}s)")
                 for p in prests:
                     todos.append({"usuario":u,"profesional":p["nombre"],"cuit":p["cuit"],
                                   "html":None,"pdf":None,"estado":"error_timeout",
