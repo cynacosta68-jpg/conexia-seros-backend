@@ -137,6 +137,17 @@ def _run_parte(parte: int, desde: int, hasta: int):
     ) if OUTPUT_DIR.exists() else []
     e["carpeta"] = str(subcarpetas[0]) if subcarpetas else None
 
+    # Re-unificar automáticamente con TODAS las partes completadas.
+    # Así el Excel unificado siempre refleja todas las partes 'done' sin
+    # depender de que el frontend llame a /unificar en el momento justo
+    # (antes solo quedaba consolidada la parte 1, la única 'done' cuando
+    # el frontend llamaba a /unificar).
+    if e["status"] == "done":
+        try:
+            _unificar_background()
+        except Exception as ex:
+            log.error(f"Error al re-unificar tras la parte {parte}: {ex}")
+
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
@@ -277,7 +288,16 @@ def _unificar_background():
         except Exception as ex:
             log.error(f"Error generando Excel unificado: {ex}")
 
-        log.info(f"✓ Unificación completada: {carpeta_unif}")
+        log.info(f"✓ Unificación completada con partes {partes_done}: {carpeta_unif}")
+
+        # Limpiar carpetas 'unificado_*' anteriores para no acumular disco;
+        # se conserva solo la recién creada (la más completa).
+        try:
+            for d in OUTPUT_DIR.glob("unificado_*"):
+                if d.is_dir() and d != carpeta_unif:
+                    shutil.rmtree(d, ignore_errors=True)
+        except Exception as ex:
+            log.warning(f"No se pudieron limpiar unificados viejos: {ex}")
     except Exception as e:
         log.error(f"Error en unificación background: {e}")
 
