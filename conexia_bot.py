@@ -141,6 +141,23 @@ async def buscar_en_contextos(page: Page, selector: str, timeout_ms=3000):
 
 async def pausa(a=1.0,b=3.0): await asyncio.sleep(random.uniform(a,b))
 def nom_seg(t,n=60): return re.sub(r"\s+","_",re.sub(r"[^\w\s-]","",str(t).strip())).upper()[:n]
+
+def nom_archivo(t, n=90):
+    """Nombre de archivo LEGIBLE: conserva espacios, puntos y acentos;
+    solo quita los caracteres ilegales en un nombre de archivo."""
+    t = re.sub(r'[\\/:*?"<>|\r\n\t]', "", str(t)).strip()
+    return t[:n] or "SIN_NOMBRE"
+
+# Orígenes del "Reporte de Facturación / Facturación" en el menú de Conexia.
+# Cada uno se identifica por el href del link y se etiqueta para el nombre del PDF.
+# Nota: "Reportes → Facturación" usa el mismo endpoint que "Ambulatorio"
+# (menuReporteTotWebFactuPres.do), por eso queda cubierto por "Ambulatorio".
+ORIGENES_REPORTE = [
+    ("menuReporteTotWebFactuPres.do",         "Ambulatorio"),
+    ("menuReporteTotWebFactuRadiologia.do",   "Prácticas"),
+    ("menuReporteTotWebFactuEspecialista.do", "Prácticas Esp."),
+]
+
 def mk_dir(u,s):
     p=SALIDA/f"{datetime.now().strftime('%Y%m%d')}_{nom_seg(u+'_'+s)}"
     p.mkdir(parents=True,exist_ok=True); return p
@@ -490,6 +507,92 @@ async def ir_facturacion(page: Page) -> bool:
     return False
 
 
+async def ir_a_reporte(page: Page, href_frag: str, etiqueta: str) -> bool:
+    """
+    Navega al 'Reporte de Facturación / Facturación' de un origen concreto,
+    identificado por un fragmento de su href (p.ej. 'menuReporteTotWebFactuRadiologia.do').
+    Expande el menú, clickea ese link y espera a que aparezca el formulario.
+    Devuelve False si ese origen no existe para el prestador (no es error).
+    """
+    log.info(f"  → Reporte [{etiqueta}] (href ~ {href_frag})...")
+
+    todos_ctx = list(page.frames) + [
+        page.frame_locator("iframe").nth(0),
+        page.frame_locator("iframe").nth(1),
+        page.frame_locator("iframe").nth(2),
+    ]
+    HEADERS_PADRE = ["Ambulatorio", "Prácticas", "Prácticas Esp.", "Reportes", "Gestión", "Documentos"]
+
+    for ctx in todos_ctx:
+        try:
+            if await ctx.locator("a").count() == 0:
+                continue
+
+            # Expandir secciones del menú para que el link sea visible
+            sel_headers = ", ".join(f"a:text-is(\'{h}\')" for h in HEADERS_PADRE)
+            expandibles = ctx.locator(sel_headers)
+            for i in range(await expandibles.count()):
+                try:
+                    lnk = expandibles.nth(i)
+                    if await lnk.is_visible(timeout=800):
+                        await lnk.click()
+                        await pausa(0.3, 0.6)
+                except Exception:
+                    pass
+
+            # Buscar el link por su href
+            links = ctx.locator(f"a[href*='{href_frag}']")
+            n = await links.count()
+            if n == 0:
+                continue
+
+            clicado = False
+            for j in range(n):
+                try:
+                    lk = links.nth(j)
+                    if await lk.is_visible(timeout=1000):
+                        await lk.click()
+                        clicado = True
+                        break
+                except Exception:
+                    pass
+            # Si ninguno estaba visible, forzar el clic por JS sobre el href
+            if not clicado:
+                try:
+                    clicado = await ctx.evaluate(
+                        """(h) => { var a=document.querySelector("a[href*='"+h+"']");
+                                    if(a){ a.click(); return true; } return false; }""",
+                        href_frag,
+                    )
+                except Exception:
+                    clicado = False
+            if not clicado:
+                continue
+
+            await pausa(1.5, 2.5)
+
+            # Esperar a que el formulario de facturación aparezca
+            for _ in range(10):
+                await asyncio.sleep(1)
+                for fr in page.frames:
+                    try:
+                        if fr.url in ("about:blank", ""):
+                            continue
+                        t = (await fr.locator("body").inner_text(timeout=2_000)).lower()
+                        if ("exportar" in t and "consultar" in t) or "seleccione el periodo" in t:
+                            log.info(f"  En reporte [{etiqueta}] ✓")
+                            return True
+                    except Exception:
+                        pass
+            log.warning(f"  [{etiqueta}] clic hecho pero el formulario no apareció")
+        except Exception as e:
+            log.debug(f"  ir_a_reporte[{etiqueta}]: {e}")
+            continue
+
+    log.warning(f"  Reporte [{etiqueta}] no encontrado para este prestador.")
+    return False
+
+
 # ════════════════════════════════════════════════════════════════════════
 # DESCARGAR HTML
 # ════════════════════════════════════════════════════════════════════════
@@ -645,7 +748,13 @@ def extraer_zip(zp: Path, dest: Path, nom: str) -> Path | None:
             or next((a for a in archivos if a.lower().endswith(".htm")),None)
             or (archivos[0] if archivos else None))
             if not t: log.warning("  ZIP vacío."); return None
-            s=dest/f"{nom}.html"; s.write_bytes(zf.read(t))
+            s=dest/f"{nom}.html"
+            # Evitar sobrescribir si ya existe (p.ej. mismo profesional/origen
+            # en otro lugar de atención): agregar sufijo numérico.
+            k=2
+            while s.exists():
+                s=dest/f"{nom}_{k}.html"; k+=1
+            s.write_bytes(zf.read(t))
             log.info(f"  ✓ {s.name}")
             try: zp.unlink(missing_ok=True)
             except Exception: pass
@@ -678,29 +787,48 @@ async def html_a_pdf(html: Path, pw) -> Path | None:
 # MOTOR PRINCIPAL: login fresco por fila del Excel
 # ════════════════════════════════════════════════════════════════════════
 
-async def extraer_reporte(page, usuario: str, nombre: str, cuit: str) -> dict:
+async def extraer_reporte(page, usuario: str, nombre: str, cuit: str,
+                          sufijo_lugar: str = "") -> list:
     """
-    Con sesión activa en el dashboard, navega a Facturación,
-    llena el formulario y descarga el HTML.
+    Con sesión activa en el dashboard, extrae el 'Reporte de Facturación /
+    Facturación' de CADA origen (Ambulatorio, Prácticas, Prácticas Esp.).
+    Guarda un HTML/PDF por origen, nombrado: '{Nombre profesional}_{Origen}'.
+    Devuelve una lista de resultados (uno por origen).
     """
-    na   = nom_seg(nombre)
-    dest = mk_dir(usuario, na)
+    dest = mk_dir(usuario, nom_seg(nombre))
+    base = nom_archivo(nombre)
+    if sufijo_lugar:
+        base = f"{base}_{nom_archivo(sufijo_lugar, 25)}"
 
-    if not await ir_facturacion(page):
-        return {"usuario":usuario,"profesional":nombre,"cuit":cuit,
-                "html":None,"pdf":None,"estado":"sin_datos",
-                "detalle":"No se encontró Facturación en el menú"}
+    resultados = []
+    for href_frag, origen in ORIGENES_REPORTE:
+        r = {"usuario": usuario, "profesional": nombre, "cuit": cuit,
+             "origen": origen, "html": None, "pdf": None,
+             "estado": "sin_datos", "detalle": ""}
+        try:
+            encontrado = await ir_a_reporte(page, href_frag, origen)
+        except Exception as e:
+            log.error(f"  ir_a_reporte[{origen}]: {e}")
+            encontrado = False
 
-    html = await descargar_html(page, dest, na)
-    return {
-        "usuario":  usuario,
-        "profesional": nombre,
-        "cuit":     cuit,
-        "html":     str(html) if html else None,
-        "pdf":      None,
-        "estado":   "ok" if html else "sin_datos",
-        "detalle":  "" if html else f"Sin datos {MES} {ANIO}",
-    }
+        if not encontrado:
+            r["detalle"] = f"Origen {origen} no disponible para este prestador"
+            resultados.append(r)
+            continue
+
+        # Nombre del archivo: 'Nombre profesional_Origen'
+        nom_pdf = f"{base}_{origen}"
+        html = await descargar_html(page, dest, nom_pdf)
+        r["html"]    = str(html) if html else None
+        r["estado"]  = "ok" if html else "sin_datos"
+        r["detalle"] = "" if html else f"Sin datos {origen} {MES} {ANIO}"
+        resultados.append(r)
+        await pausa(1.0, 2.0)
+
+    # Si NINGÚN origen tuvo datos, marcar un resultado representativo
+    if not any(r["estado"] == "ok" for r in resultados):
+        log.warning(f"  {nombre}: ningún reporte de facturación con datos.")
+    return resultados
 
 
 async def login_y_procesar(ctx, usuario: str, clave: str,
@@ -787,10 +915,11 @@ async def login_y_procesar(ctx, usuario: str, clave: str,
 
         # ── DASHBOARD (prestador ya seleccionado) ────────────────────────────
         if estado in ("dashboard","facturacion"):
-            r = await extraer_reporte(page, usuario, nombre, cuit)
-            if sufijo:
-                r["lugar"] = sufijo
-            resultados.append(r)
+            rs = await extraer_reporte(page, usuario, nombre, cuit, sufijo_lugar=sufijo or "")
+            for r in rs:
+                if sufijo:
+                    r["lugar"] = sufijo
+                resultados.append(r)
         else:
             resultados.append(E(f"error_{estado}", f"Estado inesperado: {estado}"))
 
@@ -1018,7 +1147,12 @@ def consolidar_excel(todos_resultados: list, output_dir: Path) -> Path | None:
             continue
         nombre = r.get("profesional","")
         cuit   = str(r.get("cuit",""))
+        origen = r.get("origen","")
         datos  = parsear_html(html_path, nombre, cuit)
+        for f in datos["detalle"]:
+            f["Origen"] = origen
+        for f in datos["totalizador"]:
+            f["Origen"] = origen
         todas_detalle.extend(datos["detalle"])
         todos_totalizador.extend(datos["totalizador"])
 
@@ -1055,7 +1189,7 @@ def consolidar_excel(todos_resultados: list, output_dir: Path) -> Path | None:
     headers_det = ["N° Afiliado","Nombre Afiliado","Código PPM","Descripción PPM",
                    "Fecha","RRN","Manual","Nro Orden","Cant","Anticipo","Saldo",
                    "Mutual","Total Facturado","Imp Gastos","Imp Honor","Terminal",
-                   "Profesional","CUIT"]
+                   "Profesional","CUIT","Origen"]
     estilizar_hoja(ws_det, headers_det)
 
     for fila_idx, fila in enumerate(todas_detalle, 2):
@@ -1069,7 +1203,7 @@ def consolidar_excel(todos_resultados: list, output_dir: Path) -> Path | None:
     # ── Hoja Totalizador ──────────────────────────────────────────────────
     ws_tot = wb.create_sheet("Totalizador")
     headers_tot = ["Código PPM","Descripción PPM","Cantidad","Anticipo","Saldo",
-                   "Mutual","Total Facturado","Imp Gastos","Imp Honor","Profesional","CUIT"]
+                   "Mutual","Total Facturado","Imp Gastos","Imp Honor","Profesional","CUIT","Origen"]
     estilizar_hoja(ws_tot, headers_tot)
 
     for fila_idx, fila in enumerate(todos_totalizador, 2):
