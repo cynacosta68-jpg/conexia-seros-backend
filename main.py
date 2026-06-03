@@ -2,12 +2,15 @@
 main.py — API FastAPI para Bot Conexia SEROS
 Corre en PikaPods, expone endpoints para el frontend en Vercel.
 """
-import os, subprocess, json, re, sys, threading, uuid
+import os, subprocess, json, re, sys, threading, uuid, logging
 from pathlib import Path
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
+log = logging.getLogger("conexia_api")
 
 app = FastAPI(title="Conexia SEROS API")
 
@@ -140,6 +143,74 @@ def _run_parte(parte: int, desde: int, hasta: int):
 import hashlib, secrets
 from pydantic import BaseModel
 
+
+def _merge_consolidados(partes_done: list, carpeta_unif: Path, ts: str) -> Path | None:
+    """
+    Une los Consolidado_*.xlsx que generó cada parte (hojas Detalle y
+    Totalizador) en un único Excel unificado. No depende de módulos externos.
+    """
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    center      = Alignment(horizontal="center", vertical="center")
+
+    detalle_rows, total_rows = [], []
+    headers_det, headers_tot = None, None
+
+    for p in partes_done:
+        carpeta = Path(estados[p]["carpeta"])
+        xlsxs = sorted(carpeta.glob("Consolidado_*.xlsx"), reverse=True)
+        if not xlsxs:
+            log.warning(f"Parte {p}: sin Consolidado_*.xlsx en {carpeta}")
+            continue
+        try:
+            wb = openpyxl.load_workbook(xlsxs[0], read_only=True, data_only=True)
+        except Exception as ex:
+            log.error(f"Parte {p}: no se pudo leer {xlsxs[0].name}: {ex}")
+            continue
+        if "Detalle" in wb.sheetnames:
+            filas = list(wb["Detalle"].iter_rows(values_only=True))
+            if filas:
+                if headers_det is None:
+                    headers_det = filas[0]
+                detalle_rows.extend(filas[1:])
+        if "Totalizador" in wb.sheetnames:
+            filas = list(wb["Totalizador"].iter_rows(values_only=True))
+            if filas:
+                if headers_tot is None:
+                    headers_tot = filas[0]
+                total_rows.extend(filas[1:])
+        wb.close()
+
+    if not detalle_rows and not total_rows:
+        return None
+
+    def _escribir(ws, headers, filas):
+        if headers:
+            for ci, h in enumerate(headers, 1):
+                c = ws.cell(row=1, column=ci, value=h)
+                c.font = header_font; c.fill = header_fill; c.alignment = center
+            ws.freeze_panes = "A2"
+        for ri, fila in enumerate(filas, 2):
+            for ci, val in enumerate(fila, 1):
+                ws.cell(row=ri, column=ci, value=val)
+
+    out = openpyxl.Workbook()
+    ws_det = out.active; ws_det.title = "Detalle"
+    _escribir(ws_det, headers_det, detalle_rows)
+    ws_tot = out.create_sheet("Totalizador")
+    _escribir(ws_tot, headers_tot, total_rows)
+
+    ruta = carpeta_unif / f"Consolidado_unificado_{ts}.xlsx"
+    out.save(str(ruta))
+    log.info(f"Excel unificado: {ruta.name} "
+             f"({len(detalle_rows)} detalle, {len(total_rows)} totalizador)")
+    return ruta
+
+
+
 # ── Usuarios: configurar via variables de entorno en Railway ──────────────────
 # Formato: USERS=usuario1:clave1,usuario2:clave2
 def _cargar_usuarios():
@@ -200,17 +271,11 @@ def _unificar_background():
             for pdf in todos_pdfs:
                 zf.write(pdf, pdf.name)
 
-        # Excel consolidado
-        import sys as _sys
-        _sys.path.insert(0, ".")
+        # Excel consolidado uniendo los Consolidado_*.xlsx de cada parte
         try:
-            import generar_excel as _ge
-            import os as _os
-            _os.environ["OUTPUT_DIR"] = str(carpeta_unif)
-            _ge.OUTPUT = carpeta_unif
-            _ge.main()
+            _merge_consolidados(partes_done, carpeta_unif, ts)
         except Exception as ex:
-            log.error(f"Error generando Excel: {ex}")
+            log.error(f"Error generando Excel unificado: {ex}")
 
         log.info(f"✓ Unificación completada: {carpeta_unif}")
     except Exception as e:
@@ -295,8 +360,8 @@ def get_status():
 
 @app.get("/log")
 def get_log():
-    """Log completo de la última ejecución."""
-    return {"log": estado["log"]}
+    """Log completo de la última ejecución, por parte."""
+    return {"log": {str(p): estados[p]["log"] for p in estados}}
 
 
 def _buscar_en_carpeta(carpeta_str: str | None, patron: str) -> Path | None:
@@ -411,18 +476,12 @@ def unificar():
         for pdf in todos_pdfs:
             zf.write(pdf, pdf.name)
 
-    # Generar Excel consolidado con todos los HTMLs
-    import sys as _sys
-    _sys.path.insert(0, ".")
+    # Generar Excel consolidado uniendo los Consolidado_*.xlsx de cada parte
     try:
-        import generar_excel as _ge
-        import os as _os
-        _os.environ["OUTPUT_DIR"] = str(carpeta_unif)
-        _ge.OUTPUT = carpeta_unif
-        _ge.main()
-        excel_files = list(carpeta_unif.glob("Consolidado_*.xlsx"))
-        excel_ok = len(excel_files) > 0
+        ruta_excel = _merge_consolidados(partes_done, carpeta_unif, ts)
+        excel_ok = ruta_excel is not None
     except Exception as ex:
+        log.error(f"Error al unir Excel consolidado: {ex}")
         excel_ok = False
 
     return {
