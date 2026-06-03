@@ -1182,14 +1182,16 @@ async def main():
         log.info(f"ZIP PDFs: {zip_path.name} ({len(pdfs)} archivos)")
 
     # ── Excel consolidado ─────────────────────────────────────────────────────
+    # Usar la función interna consolidar_excel (parsea los HTML descargados y
+    # arma el Excel). Antes se intentaba importar un módulo externo
+    # 'generar_excel' que, al no existir, hacía que no se consolidara nada.
     try:
-        import generar_excel
-        log.info("\nGenerando Excel consolidado...")
-        generar_excel.main()
-    except ImportError:
-        log.warning("generar_excel.py no encontrado.")
+        ruta_xlsx = consolidar_excel(todos, SALIDA)
+        if ruta_xlsx is None:
+            log.warning("No se generó el Excel consolidado (sin datos parseables).")
     except Exception as e:
-        log.error(f"Error al generar Excel: {e}")
+        log.error(f"Error al generar Excel consolidado: {e}")
+        import traceback; log.debug(traceback.format_exc())
 
     log.info(f"Salida: {SALIDA.resolve()}")
 if __name__=="__main__": asyncio.run(main())
