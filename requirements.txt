@@ -7,3 +7,4 @@ python-dateutil
 beautifulsoup4
 lxml
 python-multipart
+pdfplumber
