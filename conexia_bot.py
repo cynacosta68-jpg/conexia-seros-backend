@@ -9,6 +9,7 @@ import asyncio, random, logging, zipfile, re, sys, json
 from pathlib import Path
 from datetime import date, datetime
 from collections import defaultdict
+from urllib.parse import urljoin
 
 import openpyxl
 from dateutil.relativedelta import relativedelta
@@ -699,9 +700,43 @@ async def descargar_pdf(page: Page, dest: Path, nom: str) -> Path | None:
                         destino.write_bytes(zf.read(pdfs[0])); return True
             return False
 
-        # ── Un solo clic. La descarga (ZIP con el PDF) la dispara una ventana
-        #    paralela, así que adjuntamos el oyente de 'download' tanto a la
-        #    página principal como a CUALQUIER ventana nueva apenas aparece.
+        # ── Plan A: leer el href/onclick real del botón y bajar el ZIP directo
+        #    por su URL (con la misma sesión). Es lo más robusto. ──────────────
+        info = await fr_pdf.evaluate("""() => {
+            var img=document.querySelector("img[src*='type_file_pdf']");
+            if(!img) return null;
+            var a=img.closest('a');
+            return {
+                href:   a ? a.getAttribute('href') : null,
+                onclick:(a ? a.getAttribute('onclick') : null) || img.getAttribute('onclick'),
+                base:   document.baseURI
+            };
+        }""")
+        log.info(f"  PDF botón → {info}")
+
+        urls_candidatas = []
+        if info:
+            base = info.get("base") or fr_pdf.url
+            href = (info.get("href") or "").strip()
+            oc   = (info.get("onclick") or "")
+            if href and not href.lower().startswith("javascript:") and href != "#":
+                urls_candidatas.append(urljoin(base, href))
+            # URLs dentro del onclick (window.open('...'), location='...', etc.)
+            for m in re.findall(r"""['"]([^'"]+\.(?:do|zip|pdf)(?:\?[^'"]*)?)['"]""", oc):
+                urls_candidatas.append(urljoin(base, m))
+
+        for u in urls_candidatas:
+            try:
+                resp = await page.context.request.get(u)
+                if resp.ok and _guardar(await resp.body()):
+                    log.info(f"  ✓ {destino.name} (url directa)")
+                    return destino
+            except Exception:
+                pass
+
+        # ── Plan B: un solo clic. La descarga (ZIP con el PDF) la dispara una
+        #    ventana paralela, así que adjuntamos el oyente de 'download' tanto a
+        #    la página principal como a CUALQUIER ventana nueva apenas aparece.
         #    Así no importa el timing ni en qué página caiga la descarga. ──────
         holder = {}
         ev = asyncio.Event()
