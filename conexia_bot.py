@@ -150,15 +150,17 @@ def nom_archivo(t, n=90):
     return t[:n] or "SIN_NOMBRE"
 
 # Orígenes del "Reporte de Facturación / Facturación" en el menú de Conexia.
-# Cada uno: (fragmento del href del link, etiqueta, formato de descarga).
-# - Prácticas se baja en PDF: su HTML no trae Nombre/Documento del afiliado,
-#   pero el PDF del servidor sí los incluye.
-# - Ambulatorio y Prácticas Esp. se bajan en HTML (ya traen todo).
-# Nota: "Reportes → Facturación" usa el mismo endpoint que "Ambulatorio".
+# Cada uno: (fragmento del href, etiqueta, modo).
+#   "html" → baja HTML, parsea HTML, entregable = HTML convertido a PDF
+#   "pdf"  → baja el PDF del servidor (una sola consulta), parsea el PDF,
+#            entregable = ese PDF (prolijo y con el detalle completo)
+# - Prácticas y Prácticas Esp.: el PDF del servidor trae Nombre/Documento del
+#   afiliado y se ve bien; el HTML convertido a PDF queda roto. Por eso van en PDF.
+#   (No se pueden bajar dos formatos a la vez, así que se baja solo el PDF.)
 ORIGENES_REPORTE = [
     ("menuReporteTotWebFactuPres.do",         "Ambulatorio",    "html"),
     ("menuReporteTotWebFactuRadiologia.do",   "Prácticas",      "pdf"),
-    ("menuReporteTotWebFactuEspecialista.do", "Prácticas Esp.", "html"),
+    ("menuReporteTotWebFactuEspecialista.do", "Prácticas Esp.", "pdf"),
 ]
 
 def mk_dir(u,s):
@@ -1041,8 +1043,7 @@ async def extraer_reporte(page, usuario: str, nombre: str, cuit: str,
         else:
             archivo = await descargar_html(page, dest, nom_base)
 
-        # Se guarda la ruta en 'html' (campo de archivo genérico); el parser
-        # detecta por extensión si es .pdf o .html.
+        # Ruta de parseo en 'html' (el parser detecta por extensión .pdf/.html).
         r["html"]    = str(archivo) if archivo else None
         r["estado"]  = "ok" if archivo else "sin_datos"
         r["detalle"] = "" if archivo else f"Sin datos {origen} {MES} {ANIO}"
@@ -1511,6 +1512,17 @@ _PDF_PRAC_RE = _re.compile(
     r"(?P<fp>\w+)\s+(?P<tipo>\w+)(?:\s+(?P<coseguro>[\d.]+))?\s*$"
 )
 
+# Detalle del PDF de Prácticas Esp. (orden de columnas del reporte del servidor):
+# RRN | Tipo y Nro.Doc | Nombre | Código PPM | Compl. | Fecha y Hora | Cant. |
+# Recargo | Saldo | Anticipo | Total Fact. | Tipo Imp. | Forma Pago |
+# [Prog.Espec.] [Excep.] | Coseguro
+_PDF_ESP_RE = _re.compile(
+    r"^(?P<rrn>\d{9})\s+(?P<doc>\d{2}-\d+)\s+(?P<nombre>.+?)\s*(?P<cod>\d{6})\s+"
+    r"(?P<compl>\S+)\s+(?P<fecha>\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2})\s+(?P<cant>\d+)\s+"
+    r"(?P<recargo>[\d.]+)\s+(?P<saldo>[\d.]+)\s+(?P<anticipo>[\d.]+)\s+(?P<total>[\d.]+)\s+"
+    r"(?P<tipo>[A-Za-z]+)\s+(?P<fp>[A-Za-z]+)\s+(?:(?P<excep>[A-Za-z]+)\s+)?(?P<coseguro>[\d.]+)\s*$"
+)
+
 
 def _lineas_pdf(pdf_path: Path) -> list:
     """
@@ -1528,12 +1540,17 @@ def _lineas_pdf(pdf_path: Path) -> list:
         out = []
         with pdfplumber.open(str(pdf_path)) as pdf:
             for page in pdf.pages:
-                bandas = defaultdict(list)
-                for w in page.extract_words():
-                    bandas[round(w["top"] / 3)].append(w)
-                for key in sorted(bandas):
-                    ws = sorted(bandas[key], key=lambda w: w["x0"])
-                    out.append(" ".join(w["text"] for w in ws))
+                # Agrupar palabras por línea según cercanía vertical (gap).
+                # Mejor que round(top/N): no parte filas que cruzan un límite.
+                lineas, cur, last = [], [], None
+                for w in sorted(page.extract_words(), key=lambda w: w["top"]):
+                    if last is not None and (w["top"] - last) > 2.5:
+                        lineas.append(cur); cur = []
+                    cur.append(w); last = w["top"]
+                if cur:
+                    lineas.append(cur)
+                for L in lineas:
+                    out.append(" ".join(x["text"] for x in sorted(L, key=lambda w: w["x0"])))
         if out:
             return out
     except ImportError:
@@ -1603,16 +1620,52 @@ def _parse_practicas_pdf(pdf_path, prof, cuit, origen):
     return filas
 
 
+def _parse_practicas_esp_pdf(pdf_path, prof, cuit, origen):
+    """
+    Detalle de Prácticas Esp. leído del PDF del servidor (trae Nombre y Documento
+    del afiliado). El PDF del servidor incluye TODO el detalle y se ve prolijo,
+    a diferencia del HTML convertido. Validado con FELHI (20 filas).
+    """
+    filas = []
+    for ln in _lineas_pdf(Path(pdf_path)):
+        m = _PDF_ESP_RE.match(ln.strip())
+        if not m:
+            continue
+        d = m.groupdict()
+        compl = (d.get("compl") or "").strip()
+        if compl in ("---", "--", "-"):
+            compl = ""
+        filas.append(_fila_unif(
+            origen, prof, cuit,
+            RRN=d["rrn"],
+            **{"Nro/Tipo Doc":     d["doc"],
+               "Nombre Afiliado":  d["nombre"].strip(),
+               "Código PPM":       d["cod"],
+               "Ámbito/Compl.":    compl,
+               "Fecha":            d["fecha"],
+               "Cant.":            _num(d["cant"]),
+               "Recargo Práctica": _num(d["recargo"]),
+               "Saldo":            _num(d["saldo"]),
+               "Anticipo":         _num(d["anticipo"]),
+               "Total Fact.":      _num(d["total"]),
+               "Coseguro":         _num(d["coseguro"] or 0),
+               "Forma Pago":       d["fp"],
+               "Tipo":             d["tipo"],
+               "Excep.":           (d.get("excep") or "")}))
+    return filas
+
+
 def parsear_por_origen(archivo: Path, prof: str, cuit: str, origen: str) -> list:
     """
     Despacha al parser correcto según el origen y el tipo de archivo, y devuelve
-    filas unificadas. Prácticas se lee del PDF; el resto del HTML.
+    filas unificadas. Prácticas y Prácticas Esp. se leen del PDF; Ambulatorio del HTML.
     """
     o = (origen or "").lower()
     archivo = Path(archivo)
     try:
         if str(archivo).lower().endswith(".pdf"):
-            # Hoy solo Prácticas se baja en PDF.
+            if "esp" in o:
+                return _parse_practicas_esp_pdf(archivo, prof, cuit, origen or "Prácticas Esp.")
             return _parse_practicas_pdf(archivo, prof, cuit, origen or "Prácticas")
         if "esp" in o:
             return _parse_practicas_esp(archivo, prof, cuit, origen)
@@ -1787,7 +1840,9 @@ async def main():
         await browser.close()
 
         # ── HTML → PDF ────────────────────────────────────────────────────────
-        htmls = list(SALIDA.rglob("*.html"))
+        # (si ya existe un PDF del servidor con el mismo nombre, no se convierte:
+        #  el del servidor se ve prolijo y el convertido del HTML quedaría roto)
+        htmls = [h for h in SALIDA.rglob("*.html") if not h.with_suffix(".pdf").exists()]
         if htmls:
             log.info(f"\nCONVIRTIENDO {len(htmls)} HTML → PDF")
             async with async_playwright() as pw2:
