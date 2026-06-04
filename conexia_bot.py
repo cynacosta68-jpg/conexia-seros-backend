@@ -599,11 +599,13 @@ async def ir_a_reporte(page: Page, href_frag: str, etiqueta: str) -> bool:
 # ════════════════════════════════════════════════════════════════════════
 # DESCARGAR HTML
 # ════════════════════════════════════════════════════════════════════════
-def _js_form_fill() -> str:
-    """JS que selecciona Mes, Año y el radio del formulario de Facturación."""
+def _js_form_fill(formato: str = "HTML") -> str:
+    """JS que selecciona Mes, Año y el radio de formato (PDF/HTML/TXT) del
+    formulario de Facturación. El formato se elige por name=tipoReporte value=...
+    (con fallback por índice: PDF=0, html=1, txt=2)."""
     return f"""
     () => {{
-        var I = {{s:0, mes:false, anio:false, r:0, ok:false, err:[]}};
+        var I = {{s:0, mes:false, anio:false, r:0, ok:false, fmt:'', err:[]}};
         var sels = document.querySelectorAll('select');
         I.s = sels.length;
         var sM=null,sA=null;
@@ -624,13 +626,23 @@ def _js_form_fill() -> str:
                 sA.dispatchEvent(new Event('change',{{bubbles:true}}));
                 I.anio=true; break;}}}} }}
         else I.err.push('Año');
+
         var rs=document.querySelectorAll('input[type="radio"]');
         I.r=rs.length;
-        if(rs.length>1){{
+        var elegido = document.querySelector('input[type=radio][name="tipoReporte"][value="{formato}"]')
+                   || document.querySelector('input[type=radio][value="{formato}"]');
+        if(elegido){{
             for(var r of rs) r.checked=false;
-            rs[1].checked=true; rs[1].click();
-            rs[1].dispatchEvent(new Event('change',{{bubbles:true}}));
-            I.ok=true;
+            elegido.checked=true; elegido.click();
+            elegido.dispatchEvent(new Event('change',{{bubbles:true}}));
+            I.ok=true; I.fmt=elegido.value;
+        }} else if(rs.length>1){{
+            var idx = ('{formato}'==='PDF')?0:(('{formato}'==='TXT')?2:1);
+            if(idx>=rs.length) idx=1;
+            for(var r of rs) r.checked=false;
+            rs[idx].checked=true; rs[idx].click();
+            rs[idx].dispatchEvent(new Event('change',{{bubbles:true}}));
+            I.ok=true; I.fmt='idx'+idx;
         }} else if(rs.length==1){{ rs[0].checked=true; rs[0].click(); I.ok=true; }}
         else I.err.push('Radios');
         return I;
@@ -640,9 +652,9 @@ def _js_form_fill() -> str:
 
 async def descargar_pdf(page: Page, dest: Path, nom: str) -> Path | None:
     """
-    Llena el formulario y descarga el PDF del reporte clickeando el botón con la
-    imagen 'type_file_pdf.gif'. El PDF del servidor trae los datos completos
-    (Nombre y Documento del afiliado), que el HTML de Prácticas no incluye.
+    Descarga el reporte en PDF: selecciona el formato PDF (radio name=tipoReporte
+    value=PDF) y aprieta Consultar. El servidor arma un ZIP con el PDF adentro,
+    que puede bajar en la página o abrirse en una pestaña paralela; se extrae el PDF.
     """
     log.info(f"  ↓ PDF — {MES} {ANIO}")
     try:
@@ -662,27 +674,12 @@ async def descargar_pdf(page: Page, dest: Path, nom: str) -> Path | None:
         if ctx is None:
             log.error("  PDF: sin selects en ningún contexto."); return None
 
-        fi = await ctx.evaluate(_js_form_fill())
+        # Formato = PDF + fecha
+        fi = await ctx.evaluate(_js_form_fill("PDF"))
         log.info(f"  Form JS (pdf): {fi}")
         if not fi["mes"] or not fi["anio"]:
             log.error(f"  PDF: fecha no seleccionada: {fi['err']}"); return None
         await pausa(0.3, 0.6)
-
-        # Ubicar el frame y el elemento del botón PDF (img type_file_pdf.gif)
-        fr_pdf, loc_pdf = None, None
-        for fr in page.frames:
-            try:
-                loc = fr.locator("img[src*='type_file_pdf']")
-                if await loc.count() > 0:
-                    fr_pdf, loc_pdf = fr, loc.first
-                    break
-            except Exception:
-                pass
-
-        if loc_pdf is None:
-            log.warning("  PDF: botón type_file_pdf no encontrado. Diagnóstico:")
-            await _diag_exportar(page)
-            return None
 
         destino = dest / f"{nom}.pdf"
         k = 2
@@ -692,7 +689,7 @@ async def descargar_pdf(page: Page, dest: Path, nom: str) -> Path | None:
         def _guardar(b: bytes) -> bool:
             if b[:4] == b"%PDF":
                 destino.write_bytes(b); return True
-            if b[:2] == b"PK":   # vino comprimido
+            if b[:2] == b"PK":
                 import io
                 with zipfile.ZipFile(io.BytesIO(b)) as zf:
                     pdfs = [a for a in zf.namelist() if a.lower().endswith(".pdf")]
@@ -700,111 +697,114 @@ async def descargar_pdf(page: Page, dest: Path, nom: str) -> Path | None:
                         destino.write_bytes(zf.read(pdfs[0])); return True
             return False
 
-        # ── Plan A: leer el href/onclick real del botón y bajar el ZIP directo
-        #    por su URL (con la misma sesión). Es lo más robusto. ──────────────
-        info = await fr_pdf.evaluate("""() => {
-            var img=document.querySelector("img[src*='type_file_pdf']");
-            if(!img) return null;
-            var a=img.closest('a');
-            return {
-                href:   a ? a.getAttribute('href') : null,
-                onclick:(a ? a.getAttribute('onclick') : null) || img.getAttribute('onclick'),
-                base:   document.baseURI
-            };
-        }""")
-        log.info(f"  PDF botón → {info}")
-
-        urls_candidatas = []
-        if info:
-            base = info.get("base") or fr_pdf.url
-            href = (info.get("href") or "").strip()
-            oc   = (info.get("onclick") or "")
-            if href and not href.lower().startswith("javascript:") and href != "#":
-                urls_candidatas.append(urljoin(base, href))
-            # URLs dentro del onclick (window.open('...'), location='...', etc.)
-            for m in re.findall(r"""['"]([^'"]+\.(?:do|zip|pdf)(?:\?[^'"]*)?)['"]""", oc):
-                urls_candidatas.append(urljoin(base, m))
-
-        for u in urls_candidatas:
+        # Botón Consultar (mismos selectores que el HTML)
+        loc_btn = None
+        for sel in ["input[value='Consultar']", "input[value*='Consultar']",
+                    "button:has-text('Consultar')", "input[type='button'][value*='Consultar']",
+                    "input[type='submit'][value*='Consultar']", "a:has-text('Consultar')"]:
             try:
-                resp = await page.context.request.get(u)
-                if resp.ok and _guardar(await resp.body()):
-                    log.info(f"  ✓ {destino.name} (url directa)")
-                    return destino
+                b = ctx.locator(sel)
+                if await b.count() > 0:
+                    loc_btn = b.first; break
             except Exception:
                 pass
 
-        # ── Plan B: un solo clic. La descarga (ZIP con el PDF) la dispara una
-        #    ventana paralela, así que adjuntamos el oyente de 'download' tanto a
-        #    la página principal como a CUALQUIER ventana nueva apenas aparece.
-        #    Así no importa el timing ni en qué página caiga la descarga. ──────
-        holder = {}
+        # Captura: descarga (página o pestaña paralela) + URLs de red del reporte
+        holder = {"popups": [], "urls": []}
         ev = asyncio.Event()
+
+        def _es_reporte(u):
+            ul = (u or "").lower()
+            return (ul.endswith(".zip") or ul.endswith(".pdf")
+                    or "reportes/output" in ul or "factu" in ul
+                    or "radiolog" in ul or "especialista" in ul)
 
         def _on_download(d):
             if "dl" not in holder:
-                holder["dl"] = d
-                ev.set()
+                holder["dl"] = d; ev.set()
+
+        def _on_response(resp):
+            try:
+                if _es_reporte(resp.url) and resp.url not in holder["urls"]:
+                    holder["urls"].append(resp.url)
+            except Exception:
+                pass
 
         def _on_page(p):
+            holder["popups"].append(p)
             try: p.on("download", _on_download)
             except Exception: pass
-            holder.setdefault("popups", []).append(p)
+            try: p.on("response", _on_response)
+            except Exception: pass
 
         page.on("download", _on_download)
+        page.on("response", _on_response)
         page.context.on("page", _on_page)
         try:
+            if loc_btn is not None:
+                try: await loc_btn.click()
+                except Exception: await loc_btn.click(force=True)
+            else:
+                await ctx.evaluate("""() => {
+                    for (var e of document.querySelectorAll('input,button,a')){
+                        var t=(e.value||e.textContent||'').trim().toLowerCase();
+                        if(t==='consultar'||t.includes('consultar')){ e.click(); return true; }
+                    } return false; }""")
             try:
-                await loc_pdf.click()
-            except Exception:
-                await loc_pdf.click(force=True)
-            try:
-                await asyncio.wait_for(ev.wait(), timeout=35)
+                await asyncio.wait_for(ev.wait(), timeout=25)
             except asyncio.TimeoutError:
                 pass
+            await pausa(1.0, 1.5)
         finally:
-            try: page.remove_listener("download", _on_download)
-            except Exception: pass
-            try: page.context.remove_listener("page", _on_page)
-            except Exception: pass
+            for tgt, evt, cb in [(page, "download", _on_download),
+                                 (page, "response", _on_response),
+                                 (page.context, "page", _on_page)]:
+                try: tgt.remove_listener(evt, cb)
+                except Exception: pass
 
-        # ¿Capturamos la descarga (en la página o en la ventana paralela)?
+        # 1) Descarga capturada (página o pestaña paralela)
         if "dl" in holder:
             try:
                 d = holder["dl"]
                 tmp = dest / (d.suggested_filename or f"{nom}.zip")
                 await d.save_as(str(tmp))
-                ok = _guardar(tmp.read_bytes())   # extrae el PDF del ZIP
+                ok = _guardar(tmp.read_bytes())
                 try: tmp.unlink(missing_ok=True)
                 except Exception: pass
-                # cerrar ventanas paralelas abiertas
-                for p in holder.get("popups", []):
+                for p in holder["popups"]:
                     try: await p.close()
                     except Exception: pass
                 if ok:
-                    log.info(f"  ✓ {destino.name}"); return destino
+                    log.info(f"  ✓ {destino.name} (descarga)"); return destino
             except Exception as e:
                 log.error(f"  PDF: error guardando descarga: {e}")
 
-        # Plan B: alguna ventana paralela quedó con la URL del PDF/ZIP → bajarla
-        for p in holder.get("popups", []):
+        # 2) Re-pedir las URLs de reporte vistas en la red (misma sesión)
+        candidatas = list(holder["urls"])
+        for p in holder["popups"]:
             try:
-                u = p.url
-                if u and not u.startswith("about:"):
-                    resp = await page.context.request.get(u)
-                    if _guardar(await resp.body()):
-                        log.info(f"  ✓ {destino.name} (url ventana)")
-                        for pp in holder.get("popups", []):
-                            try: await pp.close()
-                            except Exception: pass
-                        return destino
+                if p.url and not p.url.startswith("about:"):
+                    candidatas.append(p.url)
             except Exception:
                 pass
-        for p in holder.get("popups", []):
+        if candidatas:
+            log.info(f"  PDF URLs candidatas: {candidatas}")
+        for u in candidatas:
+            try:
+                resp = await page.context.request.get(u)
+                if resp.ok and _guardar(await resp.body()):
+                    log.info(f"  ✓ {destino.name} (red)")
+                    for p in holder["popups"]:
+                        try: await p.close()
+                        except Exception: pass
+                    return destino
+            except Exception:
+                pass
+        for p in holder["popups"]:
             try: await p.close()
             except Exception: pass
 
-        log.warning("  PDF: el botón existe pero no se pudo capturar el archivo. Diagnóstico:")
+        log.warning("  PDF: no se pudo capturar el archivo. Diagnóstico:")
         await _diag_exportar(page)
         return None
 
