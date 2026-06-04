@@ -149,13 +149,15 @@ def nom_archivo(t, n=90):
     return t[:n] or "SIN_NOMBRE"
 
 # Orígenes del "Reporte de Facturación / Facturación" en el menú de Conexia.
-# Cada uno se identifica por el href del link y se etiqueta para el nombre del PDF.
-# Nota: "Reportes → Facturación" usa el mismo endpoint que "Ambulatorio"
-# (menuReporteTotWebFactuPres.do), por eso queda cubierto por "Ambulatorio".
+# Cada uno: (fragmento del href del link, etiqueta, formato de descarga).
+# - Prácticas se baja en PDF: su HTML no trae Nombre/Documento del afiliado,
+#   pero el PDF del servidor sí los incluye.
+# - Ambulatorio y Prácticas Esp. se bajan en HTML (ya traen todo).
+# Nota: "Reportes → Facturación" usa el mismo endpoint que "Ambulatorio".
 ORIGENES_REPORTE = [
-    ("menuReporteTotWebFactuPres.do",         "Ambulatorio"),
-    ("menuReporteTotWebFactuRadiologia.do",   "Prácticas"),
-    ("menuReporteTotWebFactuEspecialista.do", "Prácticas Esp."),
+    ("menuReporteTotWebFactuPres.do",         "Ambulatorio",    "html"),
+    ("menuReporteTotWebFactuRadiologia.do",   "Prácticas",      "pdf"),
+    ("menuReporteTotWebFactuEspecialista.do", "Prácticas Esp.", "html"),
 ]
 
 def mk_dir(u,s):
@@ -596,6 +598,133 @@ async def ir_a_reporte(page: Page, href_frag: str, etiqueta: str) -> bool:
 # ════════════════════════════════════════════════════════════════════════
 # DESCARGAR HTML
 # ════════════════════════════════════════════════════════════════════════
+def _js_form_fill() -> str:
+    """JS que selecciona Mes, Año y el radio del formulario de Facturación."""
+    return f"""
+    () => {{
+        var I = {{s:0, mes:false, anio:false, r:0, ok:false, err:[]}};
+        var sels = document.querySelectorAll('select');
+        I.s = sels.length;
+        var sM=null,sA=null;
+        for(var s of sels){{
+            var ts=Array.from(s.options).map(o=>o.text.trim());
+            if(ts.includes('{MES}'))  sM=s;
+            if(ts.includes('{ANIO}')) sA=s;
+        }}
+        if(sM){{ for(var i=0;i<sM.options.length;i++){{
+            if(sM.options[i].text.trim()==='{MES}'){{
+                sM.selectedIndex=i;
+                sM.dispatchEvent(new Event('change',{{bubbles:true}}));
+                I.mes=true; break;}}}} }}
+        else I.err.push('Mes');
+        if(sA){{ for(var i=0;i<sA.options.length;i++){{
+            if(sA.options[i].text.trim()==='{ANIO}'){{
+                sA.selectedIndex=i;
+                sA.dispatchEvent(new Event('change',{{bubbles:true}}));
+                I.anio=true; break;}}}} }}
+        else I.err.push('Año');
+        var rs=document.querySelectorAll('input[type="radio"]');
+        I.r=rs.length;
+        if(rs.length>1){{
+            for(var r of rs) r.checked=false;
+            rs[1].checked=true; rs[1].click();
+            rs[1].dispatchEvent(new Event('change',{{bubbles:true}}));
+            I.ok=true;
+        }} else if(rs.length==1){{ rs[0].checked=true; rs[0].click(); I.ok=true; }}
+        else I.err.push('Radios');
+        return I;
+    }}
+    """
+
+
+async def descargar_pdf(page: Page, dest: Path, nom: str) -> Path | None:
+    """
+    Llena el formulario y descarga el PDF del reporte clickeando el botón con la
+    imagen 'type_file_pdf.gif'. El PDF del servidor trae los datos completos
+    (Nombre y Documento del afiliado), que el HTML de Prácticas no incluye.
+    """
+    log.info(f"  ↓ PDF — {MES} {ANIO}")
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+
+        ctx = None
+        for fr in page.frames:
+            try:
+                if fr.url in ("about:blank", ""):
+                    continue
+                if await fr.locator("select").count() >= 1:
+                    ctx = fr; break
+            except Exception:
+                pass
+        if ctx is None:
+            ctx, _ = await buscar_en_contextos(page, "select", timeout_ms=5000)
+        if ctx is None:
+            log.error("  PDF: sin selects en ningún contexto."); return None
+
+        fi = await ctx.evaluate(_js_form_fill())
+        log.info(f"  Form JS (pdf): {fi}")
+        if not fi["mes"] or not fi["anio"]:
+            log.error(f"  PDF: fecha no seleccionada: {fi['err']}"); return None
+        await pausa(0.3, 0.6)
+
+        # Clic en el botón PDF (img type_file_pdf.gif), buscándolo en cualquier frame
+        descarga = None
+        for fr in page.frames:
+            try:
+                loc = fr.locator("img[src*='type_file_pdf']")
+                if await loc.count() == 0:
+                    continue
+                try:
+                    async with page.expect_download(timeout=T) as dl_info:
+                        await loc.first.click()
+                    descarga = await dl_info.value
+                except Exception:
+                    # Reintento: click sobre el ancestro <a> vía JS
+                    async with page.expect_download(timeout=T) as dl_info:
+                        await fr.evaluate("""() => {
+                            var img=document.querySelector("img[src*='type_file_pdf']");
+                            if(img){ (img.closest('a')||img.parentElement||img).click(); }
+                        }""")
+                    descarga = await dl_info.value
+                if descarga:
+                    break
+            except Exception:
+                pass
+
+        if descarga is None:
+            log.warning("  PDF: no se encontró/activó el botón PDF.")
+            return None
+
+        sug = descarga.suggested_filename
+        tmp = dest / sug
+        await descarga.save_as(str(tmp))
+
+        destino = dest / f"{nom}.pdf"
+        k = 2
+        while destino.exists():
+            destino = dest / f"{nom}_{k}.pdf"; k += 1
+
+        if sug.lower().endswith(".zip"):
+            with zipfile.ZipFile(tmp) as zf:
+                pdfs = [a for a in zf.namelist() if a.lower().endswith(".pdf")]
+                if not pdfs:
+                    log.warning("  PDF: el ZIP no contiene PDF."); return None
+                destino.write_bytes(zf.read(pdfs[0]))
+            try: tmp.unlink(missing_ok=True)
+            except Exception: pass
+        else:
+            try: tmp.rename(destino)
+            except Exception: destino.write_bytes(tmp.read_bytes())
+
+        log.info(f"  ✓ {destino.name}")
+        return destino
+
+    except (PwTimeout, asyncio.TimeoutError):
+        log.error("  PDF: timeout."); return None
+    except Exception as e:
+        log.error(f"  descargar_pdf: {e}"); return None
+
+
 async def descargar_html(page: Page, dest: Path, nom: str) -> Path | None:
     log.info(f"  ↓ HTML — {MES} {ANIO}")
     try:
@@ -623,43 +752,8 @@ async def descargar_html(page: Page, dest: Path, nom: str) -> Path | None:
 
         log.info(f"  Contexto formulario: {type(ctx).__name__}")
 
-        # Seleccionar Mes, Año y radio HTML via JavaScript
-        js = f"""
-        () => {{
-            var I = {{s:0, mes:false, anio:false, r:0, ok:false, err:[]}};
-            var sels = document.querySelectorAll('select');
-            I.s = sels.length;
-            var sM=null,sA=null;
-            for(var s of sels){{
-                var ts=Array.from(s.options).map(o=>o.text.trim());
-                if(ts.includes('{MES}'))  sM=s;
-                if(ts.includes('{ANIO}')) sA=s;
-            }}
-            if(sM){{ for(var i=0;i<sM.options.length;i++){{
-                if(sM.options[i].text.trim()==='{MES}'){{
-                    sM.selectedIndex=i;
-                    sM.dispatchEvent(new Event('change',{{bubbles:true}}));
-                    I.mes=true; break;}}}} }}
-            else I.err.push('Mes');
-            if(sA){{ for(var i=0;i<sA.options.length;i++){{
-                if(sA.options[i].text.trim()==='{ANIO}'){{
-                    sA.selectedIndex=i;
-                    sA.dispatchEvent(new Event('change',{{bubbles:true}}));
-                    I.anio=true; break;}}}} }}
-            else I.err.push('Año');
-            var rs=document.querySelectorAll('input[type="radio"]');
-            I.r=rs.length;
-            if(rs.length>1){{
-                for(var r of rs) r.checked=false;
-                rs[1].checked=true; rs[1].click();
-                rs[1].dispatchEvent(new Event('change',{{bubbles:true}}));
-                I.ok=true;
-            }} else if(rs.length==1){{ rs[0].checked=true; rs[0].click(); I.ok=true; }}
-            else I.err.push('Radios');
-            return I;
-        }}
-        """
-        fi = await ctx.evaluate(js)
+        # Seleccionar Mes, Año y radio via JavaScript
+        fi = await ctx.evaluate(_js_form_fill())
         log.info(f"  Form JS: {fi}")
 
         if not fi["mes"] or not fi["anio"]:
@@ -801,7 +895,7 @@ async def extraer_reporte(page, usuario: str, nombre: str, cuit: str,
         base = f"{base}_{nom_archivo(sufijo_lugar, 25)}"
 
     resultados = []
-    for href_frag, origen in ORIGENES_REPORTE:
+    for href_frag, origen, formato in ORIGENES_REPORTE:
         r = {"usuario": usuario, "profesional": nombre, "cuit": cuit,
              "origen": origen, "html": None, "pdf": None,
              "estado": "sin_datos", "detalle": ""}
@@ -817,11 +911,22 @@ async def extraer_reporte(page, usuario: str, nombre: str, cuit: str,
             continue
 
         # Nombre del archivo: 'Nombre profesional_Origen'
-        nom_pdf = f"{base}_{origen}"
-        html = await descargar_html(page, dest, nom_pdf)
-        r["html"]    = str(html) if html else None
-        r["estado"]  = "ok" if html else "sin_datos"
-        r["detalle"] = "" if html else f"Sin datos {origen} {MES} {ANIO}"
+        nom_base = f"{base}_{origen}"
+        archivo = None
+        if formato == "pdf":
+            archivo = await descargar_pdf(page, dest, nom_base)
+            if archivo is None:
+                # Fallback: si el PDF falla, al menos bajar el HTML
+                log.warning(f"  {origen}: PDF falló, intento HTML como respaldo.")
+                archivo = await descargar_html(page, dest, nom_base)
+        else:
+            archivo = await descargar_html(page, dest, nom_base)
+
+        # Se guarda la ruta en 'html' (campo de archivo genérico); el parser
+        # detecta por extensión si es .pdf o .html.
+        r["html"]    = str(archivo) if archivo else None
+        r["estado"]  = "ok" if archivo else "sin_datos"
+        r["detalle"] = "" if archivo else f"Sin datos {origen} {MES} {ANIO}"
         resultados.append(r)
         await pausa(1.0, 2.0)
 
@@ -1121,10 +1226,255 @@ def parsear_html(html_path: Path, nombre_profesional: str, cuit: str) -> dict:
         return {"detalle": [], "totalizador": []}
 
 
+# ════════════════════════════════════════════════════════════════════════
+# PARSERS POR ORIGEN → ESQUEMA UNIFICADO (nivel detalle por prestación)
+# ════════════════════════════════════════════════════════════════════════
+
+# Columnas del Excel unificado. Los tres orígenes vuelcan acá a nivel
+# detalle; lo que un reporte no tenga queda en blanco o en 0.
+COLS_UNIF = [
+    "Origen", "Profesional", "CUIT",
+    "RRN", "Nro/Tipo Doc", "Nombre Afiliado",
+    "Código PPM", "Descripción PPM", "Ámbito/Compl.", "Fecha",
+    "Cant.", "Recargo Práctica", "Saldo", "Anticipo", "Total Fact.",
+    "Honor.", "Gasto", "Coseguro", "Forma Pago", "Tipo", "Excep.",
+]
+
+import re as _re
+
+_RRN9   = _re.compile(r"^\d{9}$")
+_COD6   = _re.compile(r"^\d{6}$")
+_DT     = _re.compile(r"^\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}$")
+_DOC    = _re.compile(r"^\d{2}-\d+$")
+_NUMTOK = _re.compile(r"^\d[\d.,]*\.?$")
+
+
+def _num(s):
+    """Texto numérico → float (tolerante; '', '---' → 0). Maneja '65107.'."""
+    s = str(s).strip().rstrip(".")
+    if not s or s == "---":
+        return 0.0
+    try:
+        return float(s.replace(",", ""))
+    except Exception:
+        return 0.0
+
+
+def _fila_unif(origen, prof, cuit, **kw):
+    base = {c: "" for c in COLS_UNIF}
+    base["Origen"] = origen
+    base["Profesional"] = prof
+    base["CUIT"] = cuit
+    base.update(kw)
+    return base
+
+
+def _tokens_html(html_path: Path) -> list:
+    """Celdas no vacías del HTML, descartando la mega-celda concatenada."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        log.error("pip install beautifulsoup4 lxml")
+        return []
+    raw = html_path.read_bytes()
+    txt = ""
+    for enc in ("utf-8", "latin-1", "cp1252"):
+        try:
+            txt = raw.decode(enc); break
+        except Exception:
+            pass
+    if not txt:
+        return []
+    soup = BeautifulSoup(txt, "lxml")
+    out = []
+    for td in soup.find_all("td"):
+        v = td.get_text(" ", strip=True).replace("\xa0", " ").strip()
+        if v and len(v) < 200:        # descarta la mega-celda con todo el reporte
+            out.append(v)
+    return out
+
+
+def _parse_ambulatorio(html_path, prof, cuit, origen):
+    """Reusa el parser histórico de Ambulatorio y lo mapea al esquema unificado."""
+    datos = parsear_html(html_path, prof, cuit)   # {'detalle':[...], 'totalizador':[...]}
+    filas = []
+    for d in datos.get("detalle", []):
+        filas.append(_fila_unif(
+            origen, prof, cuit,
+            RRN=d.get("RRN", ""),
+            **{"Nro/Tipo Doc":    d.get("N° Afiliado", ""),
+               "Nombre Afiliado": d.get("Nombre Afiliado", ""),
+               "Código PPM":      d.get("Código PPM", ""),
+               "Descripción PPM": d.get("Descripción PPM", ""),
+               "Fecha":           d.get("Fecha", ""),
+               "Cant.":           d.get("Cant", 0),
+               "Saldo":           d.get("Saldo", 0),
+               "Anticipo":        d.get("Anticipo", 0),
+               "Total Fact.":     d.get("Total Facturado", 0),
+               "Honor.":          d.get("Imp Honor", 0),
+               "Gasto":           d.get("Imp Gastos", 0)}))
+    return filas
+
+
+def _parse_practicas(html_path, prof, cuit, origen):
+    """
+    Detalle de Prácticas. Fila: RRN, Código(6), Ámbito(1 letra), Horario,
+    Recargo, Anticipo, Total Fact., Honor., Forma Pago, Tipo.
+    Saldo = Total − Anticipo; Gasto = Total − Honor; Coseguro = Anticipo
+    (derivaciones confirmadas contra los totales del reporte).
+    """
+    t = _tokens_html(html_path)
+    filas = []; i = 0; n = len(t)
+    while i < n - 9:
+        if (_RRN9.match(t[i]) and _COD6.match(t[i+1]) and
+                len(t[i+2]) == 1 and t[i+2].isalpha() and _DT.match(t[i+3])):
+            rec, ant = _num(t[i+4]), _num(t[i+5])
+            tot, hon = _num(t[i+6]), _num(t[i+7])
+            filas.append(_fila_unif(
+                origen, prof, cuit,
+                RRN=t[i],
+                **{"Código PPM":       t[i+1],
+                   "Ámbito/Compl.":    t[i+2],
+                   "Fecha":            t[i+3],
+                   "Cant.":            1,
+                   "Recargo Práctica": rec,
+                   "Saldo":            round(tot - ant, 2),
+                   "Anticipo":         ant,
+                   "Total Fact.":      tot,
+                   "Honor.":           hon,
+                   "Gasto":            round(tot - hon, 2),
+                   "Coseguro":         ant,
+                   "Forma Pago":       t[i+8],
+                   "Tipo":             t[i+9]}))
+            i += 10; continue
+        i += 1
+    return filas
+
+
+def _parse_practicas_esp(html_path, prof, cuit, origen):
+    """
+    Detalle de Prácticas Esp. Fila: RRN, Tipo/Nro Doc, Nombre, Código(6), Cant,
+    Recargo, Anticipo, Forma Pago, Coseguro, Fecha y Hora, Total Fact., Compl.,
+    Saldo, Tipo Imp. (Mapeo validado fila a fila contra el ejemplo real.)
+    """
+    t = _tokens_html(html_path)
+    filas = []; i = 0; n = len(t)
+    while i < n - 13:
+        if (_RRN9.match(t[i]) and _DOC.match(t[i+1]) and not _NUMTOK.match(t[i+2]) and
+                _COD6.match(t[i+3]) and t[i+4].isdigit()):
+            compl = "" if t[i+11] == "---" else t[i+11]
+            filas.append(_fila_unif(
+                origen, prof, cuit,
+                RRN=t[i],
+                **{"Nro/Tipo Doc":     t[i+1],
+                   "Nombre Afiliado":  t[i+2],
+                   "Código PPM":       t[i+3],
+                   "Cant.":            _num(t[i+4]),
+                   "Recargo Práctica": _num(t[i+5]),
+                   "Anticipo":         _num(t[i+6]),
+                   "Forma Pago":       t[i+7],
+                   "Coseguro":         _num(t[i+8]),
+                   "Fecha":            t[i+9],
+                   "Total Fact.":      _num(t[i+10]),
+                   "Ámbito/Compl.":    compl,
+                   "Saldo":            _num(t[i+12]),
+                   "Tipo":             t[i+13]}))
+            i += 14; continue
+        i += 1
+    return filas
+
+
+_PDF_PRAC_RE = _re.compile(
+    r"^(?P<rrn>\d{9})\s+(?P<doc>\d+)\s+(?P<nombre>.+?)\s*(?P<cod>\d{6})\s+"
+    r"(?P<ambito>[A-Za-z])\s+(?P<horario>\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2})\s+"
+    r"(?P<cant>\d+)\s+(?P<recargo>[\d.]+)\s+(?P<saldo>[\d.]+)\s+(?P<anticipo>[\d.]+)\s+"
+    r"(?P<total>[\d.]+)\s+(?P<honor>[\d.]+)\s+(?P<gasto>[\d.]+)\s+"
+    r"(?P<fp>\w+)\s+(?P<tipo>\w+)(?:\s+(?P<coseguro>[\d.]+))?\s*$"
+)
+
+
+def _lineas_pdf(pdf_path: Path) -> list:
+    """Reconstruye las líneas del PDF agrupando palabras por banda vertical."""
+    try:
+        import pdfplumber
+    except ImportError:
+        log.error("pip install pdfplumber")
+        return []
+    from collections import defaultdict
+    out = []
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for page in pdf.pages:
+                bandas = defaultdict(list)
+                for w in page.extract_words():
+                    bandas[round(w["top"] / 3)].append(w)
+                for key in sorted(bandas):
+                    ws = sorted(bandas[key], key=lambda w: w["x0"])
+                    out.append(" ".join(w["text"] for w in ws))
+    except Exception as e:
+        log.error(f"  _lineas_pdf({pdf_path.name}): {e}")
+    return out
+
+
+def _parse_practicas_pdf(pdf_path, prof, cuit, origen):
+    """
+    Detalle de Prácticas leído del PDF del servidor (trae Nombre y Documento del
+    afiliado, que el HTML no incluye). Validado contra los totales del reporte.
+    """
+    filas = []
+    for ln in _lineas_pdf(Path(pdf_path)):
+        m = _PDF_PRAC_RE.match(ln.strip())
+        if not m:
+            continue
+        d = m.groupdict()
+        filas.append(_fila_unif(
+            origen, prof, cuit,
+            RRN=d["rrn"],
+            **{"Nro/Tipo Doc":     d["doc"],
+               "Nombre Afiliado":  d["nombre"].strip(),
+               "Código PPM":       d["cod"],
+               "Ámbito/Compl.":    d["ambito"],
+               "Fecha":            d["horario"],
+               "Cant.":            _num(d["cant"]),
+               "Recargo Práctica": _num(d["recargo"]),
+               "Saldo":            _num(d["saldo"]),
+               "Anticipo":         _num(d["anticipo"]),
+               "Total Fact.":      _num(d["total"]),
+               "Honor.":           _num(d["honor"]),
+               "Gasto":            _num(d["gasto"]),
+               "Coseguro":         _num(d["coseguro"] or 0),
+               "Forma Pago":       d["fp"],
+               "Tipo":             d["tipo"]}))
+    return filas
+
+
+def parsear_por_origen(archivo: Path, prof: str, cuit: str, origen: str) -> list:
+    """
+    Despacha al parser correcto según el origen y el tipo de archivo, y devuelve
+    filas unificadas. Prácticas se lee del PDF; el resto del HTML.
+    """
+    o = (origen or "").lower()
+    archivo = Path(archivo)
+    try:
+        if str(archivo).lower().endswith(".pdf"):
+            # Hoy solo Prácticas se baja en PDF.
+            return _parse_practicas_pdf(archivo, prof, cuit, origen or "Prácticas")
+        if "esp" in o:
+            return _parse_practicas_esp(archivo, prof, cuit, origen)
+        if "práctica" in o or "practica" in o:
+            return _parse_practicas(archivo, prof, cuit, origen)
+        return _parse_ambulatorio(archivo, prof, cuit, origen or "Ambulatorio")
+    except Exception as e:
+        log.error(f"  parsear_por_origen[{origen}] {archivo.name}: {e}")
+        return []
+
+
 def consolidar_excel(todos_resultados: list, output_dir: Path) -> Path | None:
     """
-    Lee todos los HTML descargados, parsea su contenido y genera
-    un único Excel consolidado con dos hojas: Detalle y Totalizador.
+    Genera UN Excel unificado con los tres orígenes a nivel detalle, en columnas
+    normalizadas (lo que falta queda en blanco/0). Hojas:
+      • Detalle      → todas las prestaciones, con columna Origen
+      • Totalizador  → suma del detalle por Origen + Código PPM
     """
     try:
         import openpyxl
@@ -1133,94 +1483,85 @@ def consolidar_excel(todos_resultados: list, output_dir: Path) -> Path | None:
         log.error("openpyxl no instalado.")
         return None
 
-    log.info("\nGenerando Excel consolidado...")
+    log.info("\nGenerando Excel consolidado (unificado por origen)...")
 
-    todas_detalle     = []
-    todos_totalizador = []
-
-    # Recorrer resultados y parsear cada HTML
+    filas = []
     for r in todos_resultados:
         if r.get("estado") != "ok" or not r.get("html"):
             continue
         html_path = Path(r["html"])
         if not html_path.exists():
             continue
-        nombre = r.get("profesional","")
-        cuit   = str(r.get("cuit",""))
-        origen = r.get("origen","")
-        datos  = parsear_html(html_path, nombre, cuit)
-        for f in datos["detalle"]:
-            f["Origen"] = origen
-        for f in datos["totalizador"]:
-            f["Origen"] = origen
-        todas_detalle.extend(datos["detalle"])
-        todos_totalizador.extend(datos["totalizador"])
+        prof   = r.get("profesional", "")
+        cuit   = str(r.get("cuit", ""))
+        origen = r.get("origen", "Ambulatorio")
+        filas.extend(parsear_por_origen(html_path, prof, cuit, origen))
 
-    if not todas_detalle and not todos_totalizador:
+    if not filas:
         log.warning("  Sin datos para consolidar (HTMLs vacíos o no parseables).")
         return None
 
-    # Crear Excel
-    wb = openpyxl.Workbook()
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    alt_fill    = PatternFill("solid", fgColor="D6E4F0")
+    center      = Alignment(horizontal="center", vertical="center")
 
-    # ── Estilos ────────────────────────────────────────────────────────────
-    header_font  = Font(bold=True, color="FFFFFF")
-    header_fill  = PatternFill("solid", fgColor="1F4E79")
-    alt_fill     = PatternFill("solid", fgColor="D6E4F0")
-    center       = Alignment(horizontal="center", vertical="center")
-
-    def estilizar_hoja(ws, headers):
+    def estilizar(ws, headers):
         ws.row_dimensions[1].height = 20
-        for col_idx, h in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=col_idx, value=h)
-            cell.font      = header_font
-            cell.fill      = header_fill
-            cell.alignment = center
+        for ci, h in enumerate(headers, 1):
+            c = ws.cell(row=1, column=ci, value=h)
+            c.font = header_font; c.fill = header_fill; c.alignment = center
         ws.freeze_panes = "A2"
 
     def autoajustar(ws):
         for col in ws.columns:
-            max_len = max((len(str(c.value or "")) for c in col), default=8)
-            ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 40)
+            m = max((len(str(c.value or "")) for c in col), default=8)
+            ws.column_dimensions[col[0].column_letter].width = min(m + 2, 42)
 
-    # ── Hoja Detalle ──────────────────────────────────────────────────────
-    ws_det = wb.active
-    ws_det.title = "Detalle"
-    headers_det = ["N° Afiliado","Nombre Afiliado","Código PPM","Descripción PPM",
-                   "Fecha","RRN","Manual","Nro Orden","Cant","Anticipo","Saldo",
-                   "Mutual","Total Facturado","Imp Gastos","Imp Honor","Terminal",
-                   "Profesional","CUIT","Origen"]
-    estilizar_hoja(ws_det, headers_det)
+    wb = openpyxl.Workbook()
 
-    for fila_idx, fila in enumerate(todas_detalle, 2):
-        fill = alt_fill if fila_idx % 2 == 0 else None
-        for col_idx, key in enumerate(headers_det, 1):
-            cell = ws_det.cell(row=fila_idx, column=col_idx, value=fila.get(key,""))
+    # ── Hoja Detalle (unificada) ────────────────────────────────────────────
+    ws = wb.active; ws.title = "Detalle"
+    estilizar(ws, COLS_UNIF)
+    for ri, fila in enumerate(filas, 2):
+        fill = alt_fill if ri % 2 == 0 else None
+        for ci, key in enumerate(COLS_UNIF, 1):
+            cell = ws.cell(row=ri, column=ci, value=fila.get(key, ""))
             if fill:
                 cell.fill = fill
-    autoajustar(ws_det)
+    autoajustar(ws)
 
-    # ── Hoja Totalizador ──────────────────────────────────────────────────
-    ws_tot = wb.create_sheet("Totalizador")
-    headers_tot = ["Código PPM","Descripción PPM","Cantidad","Anticipo","Saldo",
-                   "Mutual","Total Facturado","Imp Gastos","Imp Honor","Profesional","CUIT","Origen"]
-    estilizar_hoja(ws_tot, headers_tot)
+    # ── Hoja Totalizador (suma del detalle por Origen + Código) ──────────────
+    from collections import OrderedDict
+    NUMER = ["Cant.", "Recargo Práctica", "Saldo", "Anticipo", "Total Fact.", "Honor.", "Gasto", "Coseguro"]
+    agg = OrderedDict()
+    for f in filas:
+        k = (f.get("Origen", ""), str(f.get("Código PPM", "")), f.get("Descripción PPM", ""))
+        a = agg.setdefault(k, {c: 0.0 for c in NUMER})
+        for c in NUMER:
+            try: a[c] += float(f.get(c) or 0)
+            except Exception: pass
 
-    for fila_idx, fila in enumerate(todos_totalizador, 2):
-        fill = alt_fill if fila_idx % 2 == 0 else None
-        for col_idx, key in enumerate(headers_tot, 1):
-            cell = ws_tot.cell(row=fila_idx, column=col_idx, value=fila.get(key,""))
+    headers_tot = ["Origen", "Código PPM", "Descripción PPM"] + NUMER
+    ws2 = wb.create_sheet("Totalizador")
+    estilizar(ws2, headers_tot)
+    for ri, (k, a) in enumerate(agg.items(), 2):
+        fill = alt_fill if ri % 2 == 0 else None
+        valores = [k[0], k[1], k[2]] + [round(a[c], 2) for c in NUMER]
+        for ci, val in enumerate(valores, 1):
+            cell = ws2.cell(row=ri, column=ci, value=val)
             if fill:
                 cell.fill = fill
-    autoajustar(ws_tot)
+    autoajustar(ws2)
 
-    # Guardar
     ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-    mes_anio  = f"{MES}_{ANIO}"
-    ruta_xlsx = output_dir / f"Consolidado_{mes_anio}_{ts}.xlsx"
+    ruta_xlsx = output_dir / f"Consolidado_{MES}_{ANIO}_{ts}.xlsx"
     wb.save(str(ruta_xlsx))
+    por_origen = {}
+    for f in filas:
+        por_origen[f["Origen"]] = por_origen.get(f["Origen"], 0) + 1
     log.info(f"  ✓ Excel consolidado: {ruta_xlsx}")
-    log.info(f"  Filas detalle: {len(todas_detalle)} | Filas totalizador: {len(todos_totalizador)}")
+    log.info(f"  Filas: {len(filas)} | por origen: {por_origen} | códigos: {len(agg)}")
     return ruta_xlsx
 
 
