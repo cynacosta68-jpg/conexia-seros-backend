@@ -1513,15 +1513,19 @@ _PDF_PRAC_RE = _re.compile(
 
 
 def _lineas_pdf(pdf_path: Path) -> list:
-    """Reconstruye las líneas del PDF agrupando palabras por banda vertical."""
+    """
+    Devuelve las líneas de texto del PDF. Intenta, en orden:
+      1) pdfplumber (reconstrucción por coordenadas) — el más preciso,
+      2) pdftotext (poppler, binario del sistema),
+      3) pypdf.
+    Si no hay ninguno disponible, avisa que falta instalar pdfplumber.
+    """
+    from collections import defaultdict
+
+    # 1) pdfplumber
     try:
         import pdfplumber
-    except ImportError:
-        log.error("pip install pdfplumber")
-        return []
-    from collections import defaultdict
-    out = []
-    try:
+        out = []
         with pdfplumber.open(str(pdf_path)) as pdf:
             for page in pdf.pages:
                 bandas = defaultdict(list)
@@ -1530,9 +1534,41 @@ def _lineas_pdf(pdf_path: Path) -> list:
                 for key in sorted(bandas):
                     ws = sorted(bandas[key], key=lambda w: w["x0"])
                     out.append(" ".join(w["text"] for w in ws))
+        if out:
+            return out
+    except ImportError:
+        pass
     except Exception as e:
-        log.error(f"  _lineas_pdf({pdf_path.name}): {e}")
-    return out
+        log.error(f"  _lineas_pdf pdfplumber({pdf_path.name}): {e}")
+
+    # 2) pdftotext (poppler) si está el binario
+    try:
+        import shutil, subprocess
+        if shutil.which("pdftotext"):
+            txt = subprocess.run(["pdftotext", "-layout", str(pdf_path), "-"],
+                                 capture_output=True, text=True).stdout
+            if txt.strip():
+                return txt.splitlines()
+    except Exception:
+        pass
+
+    # 3) pypdf
+    try:
+        from pypdf import PdfReader
+        r = PdfReader(str(pdf_path))
+        out = []
+        for pg in r.pages:
+            out += (pg.extract_text() or "").splitlines()
+        if out:
+            return out
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    log.error("  PDF: no hay lector de PDF disponible. "
+              "Agregá 'pdfplumber' al requirements.txt del backend y redesplegá.")
+    return []
 
 
 def _parse_practicas_pdf(pdf_path, prof, cuit, origen):
