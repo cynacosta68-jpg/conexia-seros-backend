@@ -667,62 +667,146 @@ async def descargar_pdf(page: Page, dest: Path, nom: str) -> Path | None:
             log.error(f"  PDF: fecha no seleccionada: {fi['err']}"); return None
         await pausa(0.3, 0.6)
 
-        # Clic en el botón PDF (img type_file_pdf.gif), buscándolo en cualquier frame
-        descarga = None
+        # Ubicar el frame y el elemento del botón PDF (img type_file_pdf.gif)
+        fr_pdf, loc_pdf = None, None
         for fr in page.frames:
             try:
                 loc = fr.locator("img[src*='type_file_pdf']")
-                if await loc.count() == 0:
-                    continue
-                try:
-                    async with page.expect_download(timeout=T) as dl_info:
-                        await loc.first.click()
-                    descarga = await dl_info.value
-                except Exception:
-                    # Reintento: click sobre el ancestro <a> vía JS
-                    async with page.expect_download(timeout=T) as dl_info:
-                        await fr.evaluate("""() => {
-                            var img=document.querySelector("img[src*='type_file_pdf']");
-                            if(img){ (img.closest('a')||img.parentElement||img).click(); }
-                        }""")
-                    descarga = await dl_info.value
-                if descarga:
+                if await loc.count() > 0:
+                    fr_pdf, loc_pdf = fr, loc.first
                     break
             except Exception:
                 pass
 
-        if descarga is None:
-            log.warning("  PDF: no se encontró/activó el botón PDF.")
+        if loc_pdf is None:
+            log.warning("  PDF: botón type_file_pdf no encontrado. Diagnóstico:")
+            await _diag_exportar(page)
             return None
-
-        sug = descarga.suggested_filename
-        tmp = dest / sug
-        await descarga.save_as(str(tmp))
 
         destino = dest / f"{nom}.pdf"
         k = 2
         while destino.exists():
             destino = dest / f"{nom}_{k}.pdf"; k += 1
 
-        if sug.lower().endswith(".zip"):
-            with zipfile.ZipFile(tmp) as zf:
-                pdfs = [a for a in zf.namelist() if a.lower().endswith(".pdf")]
-                if not pdfs:
-                    log.warning("  PDF: el ZIP no contiene PDF."); return None
-                destino.write_bytes(zf.read(pdfs[0]))
-            try: tmp.unlink(missing_ok=True)
-            except Exception: pass
-        else:
-            try: tmp.rename(destino)
-            except Exception: destino.write_bytes(tmp.read_bytes())
+        def _guardar(b: bytes) -> bool:
+            if b[:4] == b"%PDF":
+                destino.write_bytes(b); return True
+            if b[:2] == b"PK":   # vino comprimido
+                import io
+                with zipfile.ZipFile(io.BytesIO(b)) as zf:
+                    pdfs = [a for a in zf.namelist() if a.lower().endswith(".pdf")]
+                    if pdfs:
+                        destino.write_bytes(zf.read(pdfs[0])); return True
+            return False
 
-        log.info(f"  ✓ {destino.name}")
-        return destino
+        # ── Un solo clic. La descarga (ZIP con el PDF) la dispara una ventana
+        #    paralela, así que adjuntamos el oyente de 'download' tanto a la
+        #    página principal como a CUALQUIER ventana nueva apenas aparece.
+        #    Así no importa el timing ni en qué página caiga la descarga. ──────
+        holder = {}
+        ev = asyncio.Event()
+
+        def _on_download(d):
+            if "dl" not in holder:
+                holder["dl"] = d
+                ev.set()
+
+        def _on_page(p):
+            try: p.on("download", _on_download)
+            except Exception: pass
+            holder.setdefault("popups", []).append(p)
+
+        page.on("download", _on_download)
+        page.context.on("page", _on_page)
+        try:
+            try:
+                await loc_pdf.click()
+            except Exception:
+                await loc_pdf.click(force=True)
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=35)
+            except asyncio.TimeoutError:
+                pass
+        finally:
+            try: page.remove_listener("download", _on_download)
+            except Exception: pass
+            try: page.context.remove_listener("page", _on_page)
+            except Exception: pass
+
+        # ¿Capturamos la descarga (en la página o en la ventana paralela)?
+        if "dl" in holder:
+            try:
+                d = holder["dl"]
+                tmp = dest / (d.suggested_filename or f"{nom}.zip")
+                await d.save_as(str(tmp))
+                ok = _guardar(tmp.read_bytes())   # extrae el PDF del ZIP
+                try: tmp.unlink(missing_ok=True)
+                except Exception: pass
+                # cerrar ventanas paralelas abiertas
+                for p in holder.get("popups", []):
+                    try: await p.close()
+                    except Exception: pass
+                if ok:
+                    log.info(f"  ✓ {destino.name}"); return destino
+            except Exception as e:
+                log.error(f"  PDF: error guardando descarga: {e}")
+
+        # Plan B: alguna ventana paralela quedó con la URL del PDF/ZIP → bajarla
+        for p in holder.get("popups", []):
+            try:
+                u = p.url
+                if u and not u.startswith("about:"):
+                    resp = await page.context.request.get(u)
+                    if _guardar(await resp.body()):
+                        log.info(f"  ✓ {destino.name} (url ventana)")
+                        for pp in holder.get("popups", []):
+                            try: await pp.close()
+                            except Exception: pass
+                        return destino
+            except Exception:
+                pass
+        for p in holder.get("popups", []):
+            try: await p.close()
+            except Exception: pass
+
+        log.warning("  PDF: el botón existe pero no se pudo capturar el archivo. Diagnóstico:")
+        await _diag_exportar(page)
+        return None
 
     except (PwTimeout, asyncio.TimeoutError):
         log.error("  PDF: timeout."); return None
     except Exception as e:
         log.error(f"  descargar_pdf: {e}"); return None
+
+
+async def _diag_exportar(page: Page):
+    """Loguea los elementos de exportación (imgs/links/onclick) de cada frame,
+    para diagnosticar cómo se dispara la descarga del PDF en Conexia."""
+    for i, fr in enumerate(page.frames):
+        try:
+            info = await fr.evaluate("""() => {
+                const out = {imgs:[], links:[], onclicks:[]};
+                document.querySelectorAll('img').forEach(im => {
+                    const s = im.getAttribute('src')||'';
+                    if (s.toLowerCase().includes('pdf') || s.toLowerCase().includes('type_file'))
+                        out.imgs.push({src:s, parent: (im.parentElement?im.parentElement.tagName:''),
+                                       href: (im.closest('a')?im.closest('a').getAttribute('href'):''),
+                                       onclick: (im.closest('a')?im.closest('a').getAttribute('onclick'):'')});
+                });
+                document.querySelectorAll('a').forEach(a => {
+                    const h=(a.getAttribute('href')||''), oc=(a.getAttribute('onclick')||'');
+                    if ((h+oc).toLowerCase().includes('pdf')) out.links.push({href:h, onclick:oc, txt:a.textContent.trim().slice(0,20)});
+                });
+                document.querySelectorAll('[onclick]').forEach(e => {
+                    const oc=(e.getAttribute('onclick')||'');
+                    if (oc.toLowerCase().includes('pdf')) out.onclicks.push({tag:e.tagName, onclick:oc.slice(0,80)});
+                });
+                return out;
+            }""")
+            if info["imgs"] or info["links"] or info["onclicks"]:
+                log.info(f"    [diag frame {i}] {info}")
+        except Exception:
+            pass
 
 
 async def descargar_html(page: Page, dest: Path, nom: str) -> Path | None:
@@ -1531,23 +1615,24 @@ def consolidar_excel(todos_resultados: list, output_dir: Path) -> Path | None:
                 cell.fill = fill
     autoajustar(ws)
 
-    # ── Hoja Totalizador (suma del detalle por Origen + Código) ──────────────
+    # ── Hoja Totalizador (suma del detalle por Profesional + Origen + Código) ─
     from collections import OrderedDict
     NUMER = ["Cant.", "Recargo Práctica", "Saldo", "Anticipo", "Total Fact.", "Honor.", "Gasto", "Coseguro"]
     agg = OrderedDict()
     for f in filas:
-        k = (f.get("Origen", ""), str(f.get("Código PPM", "")), f.get("Descripción PPM", ""))
+        k = (f.get("Profesional", ""), str(f.get("CUIT", "")),
+             f.get("Origen", ""), str(f.get("Código PPM", "")), f.get("Descripción PPM", ""))
         a = agg.setdefault(k, {c: 0.0 for c in NUMER})
         for c in NUMER:
             try: a[c] += float(f.get(c) or 0)
             except Exception: pass
 
-    headers_tot = ["Origen", "Código PPM", "Descripción PPM"] + NUMER
+    headers_tot = ["Profesional", "CUIT", "Origen", "Código PPM", "Descripción PPM"] + NUMER
     ws2 = wb.create_sheet("Totalizador")
     estilizar(ws2, headers_tot)
     for ri, (k, a) in enumerate(agg.items(), 2):
         fill = alt_fill if ri % 2 == 0 else None
-        valores = [k[0], k[1], k[2]] + [round(a[c], 2) for c in NUMER]
+        valores = [k[0], k[1], k[2], k[3], k[4]] + [round(a[c], 2) for c in NUMER]
         for ci, val in enumerate(valores, 1):
             cell = ws2.cell(row=ri, column=ci, value=val)
             if fill:
